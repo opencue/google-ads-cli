@@ -47,19 +47,28 @@ gads-tui
 
 ## Keys
 
-| Key      | What it does                          |
-|---------:|---------------------------------------|
-| `q` `Esc`| Quit                                  |
-| `r`      | Force refresh                         |
-| `↑`/`k`  | Move selection up                     |
-| `↓`/`j`  | Move selection down                   |
-| `Ctrl+C` | Quit (same as `q`)                    |
+| Key      | What it does                                          |
+|---------:|-------------------------------------------------------|
+| `q` `Esc`| Quit (closes suggest modal first if open)             |
+| `r`      | Force refresh                                         |
+| `p`      | Toggle PAUSED ↔ ENABLED on the selected campaign      |
+| `s`      | Open `gads suggest` modal — prioritized fix punch list|
+| `↑`/`k`  | Move selection up                                     |
+| `↓`/`j`  | Move selection down                                   |
+| `Ctrl+C` | Quit (same as `q`)                                    |
+
+## Safety
+
+- `p` shells out to `gads set-status campaign <id> <new> --apply`.
+- All TUI-triggered mutations set `GADS_NO_AUTOSNAPSHOT=1` so the
+  snapshot dir doesn't balloon during a keypress-heavy session.
+- Take a manual snapshot before launching if you want one:
+  `gads snapshot save before-tui-session`
 
 ## Roadmap
 
-- Inline mutations: `b` to change budget, `p` to toggle status, `e` to
-  enable a campaign without leaving the TUI
-- `s` to open `gads suggest` output in a side panel
+- `b` to change budget (modal text input)
+- `e` (alias for ENABLED-only) and `d` (alias for PAUSED-only)
 - Asset group drill-down (Enter on selected campaign)
 - Multi-profile view: switch profiles with `Tab`
 - Live spend deltas with sparklines

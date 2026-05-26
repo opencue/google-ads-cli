@@ -18,3 +18,4 @@ tui/target/
 .idea/
 .DS_Store
 *.swp
+.omx/
