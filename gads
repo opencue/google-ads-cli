@@ -2133,6 +2133,99 @@ def cmd_suggest(args):
 # copy, and account-level assets are roadmap. The export format is TOML
 # so it's hand-editable + diff-friendly in git.
 
+def _live_ad_groups_state(customer_id):
+    """Snapshot enabled/paused ad groups (SEARCH and SEARCH-like campaigns)."""
+    res = api_call("POST", "googleAds:search", {"query": """
+        SELECT ad_group.id, ad_group.name, ad_group.status, campaign.id
+        FROM ad_group
+        WHERE ad_group.status != 'REMOVED'
+    """}, customer_id)
+    out = []
+    for row in res.get("results", []):
+        ag = row["adGroup"]
+        out.append({
+            "id": ag["id"],
+            "name": ag["name"],
+            "status": ag["status"],
+            "campaign_id": row["campaign"]["id"],
+        })
+    return out
+
+
+def _live_keywords_state(customer_id):
+    """Snapshot ad_group_criterion keywords."""
+    res = api_call("POST", "googleAds:search", {"query": """
+        SELECT ad_group_criterion.criterion_id,
+               ad_group_criterion.keyword.text,
+               ad_group_criterion.keyword.match_type,
+               ad_group_criterion.status,
+               ad_group.id
+        FROM ad_group_criterion
+        WHERE ad_group_criterion.type = 'KEYWORD'
+          AND ad_group_criterion.status != 'REMOVED'
+    """}, customer_id)
+    out = []
+    for row in res.get("results", []):
+        agc = row["adGroupCriterion"]
+        out.append({
+            "id": agc.get("criterionId"),
+            "ad_group_id": row["adGroup"]["id"],
+            "text": agc.get("keyword", {}).get("text", ""),
+            "match_type": agc.get("keyword", {}).get("matchType", ""),
+            "status": agc.get("status", "ENABLED"),
+        })
+    return out
+
+
+def _live_asset_group_text_assets_state(customer_id):
+    """Snapshot HEADLINE/DESCRIPTION/LONG_HEADLINE assets per asset group."""
+    res = api_call("POST", "googleAds:search", {"query": """
+        SELECT asset.id, asset.text_asset.text,
+               asset_group.id, asset_group_asset.field_type
+        FROM asset_group_asset
+        WHERE asset_group_asset.status != 'REMOVED'
+          AND asset_group_asset.field_type IN ('HEADLINE', 'DESCRIPTION', 'LONG_HEADLINE')
+    """}, customer_id)
+    out = []
+    for row in res.get("results", []):
+        out.append({
+            "id": row["asset"]["id"],
+            "asset_group_id": row["assetGroup"]["id"],
+            "field_type": row["assetGroupAsset"]["fieldType"],
+            "text": row["asset"].get("textAsset", {}).get("text", ""),
+        })
+    return out
+
+
+def _live_responsive_search_ads_state(customer_id):
+    """Snapshot RSAs (inline headlines + descriptions)."""
+    res = api_call("POST", "googleAds:search", {"query": """
+        SELECT ad_group_ad.ad.id,
+               ad_group_ad.ad.responsive_search_ad.headlines,
+               ad_group_ad.ad.responsive_search_ad.descriptions,
+               ad_group_ad.ad.final_urls,
+               ad_group_ad.status,
+               ad_group.id
+        FROM ad_group_ad
+        WHERE ad_group_ad.status != 'REMOVED'
+    """}, customer_id)
+    out = []
+    for row in res.get("results", []):
+        ad = row["adGroupAd"]["ad"]
+        rsa = ad.get("responsiveSearchAd")
+        if not rsa:   # only RSAs in v3
+            continue
+        out.append({
+            "id": ad["id"],
+            "ad_group_id": row["adGroup"]["id"],
+            "status": row["adGroupAd"]["status"],
+            "final_url": (ad.get("finalUrls") or [""])[0],
+            "headlines": [h.get("text", "") for h in rsa.get("headlines", [])],
+            "descriptions": [d.get("text", "") for d in rsa.get("descriptions", [])],
+        })
+    return out
+
+
 def _live_account_assets_state(customer_id):
     """Snapshot account-scope sitelinks/callouts/snippets."""
     res = api_call("POST", "googleAds:search", {"query": """
@@ -2258,6 +2351,46 @@ def _serialize_state_toml(state):
         lines.append(f'values = [{values_str}]')
         lines.append("")
 
+    # ---- v3: ad groups + keywords + asset-group text assets + RSAs ----
+    for ag in state.get("ad_groups", []):
+        lines.append("[[ad_groups]]")
+        lines.append(f'id = "{ag["id"]}"                          # readonly')
+        lines.append(f'campaign_id = "{ag["campaign_id"]}"')
+        lines.append(f'name = "{_toml_escape(ag.get("name", ""))}"')
+        lines.append(f'status = "{ag.get("status", "ENABLED")}"')
+        lines.append("")
+
+    for kw in state.get("keywords", []):
+        lines.append("[[keywords]]")
+        if kw.get("id"):
+            lines.append(f'id = "{kw["id"]}"')
+        lines.append(f'ad_group_id = "{kw["ad_group_id"]}"')
+        lines.append(f'text = "{_toml_escape(kw["text"])}"')
+        lines.append(f'match_type = "{kw["match_type"]}"')
+        lines.append("")
+
+    for ta in state.get("asset_group_text_assets", []):
+        lines.append("[[asset_group_text_assets]]")
+        if ta.get("id"):
+            lines.append(f'id = "{ta["id"]}"')
+        lines.append(f'asset_group_id = "{ta["asset_group_id"]}"')
+        lines.append(f'field_type = "{ta["field_type"]}"  # HEADLINE | DESCRIPTION | LONG_HEADLINE')
+        lines.append(f'text = "{_toml_escape(ta["text"])}"')
+        lines.append("")
+
+    for rsa in state.get("responsive_search_ads", []):
+        lines.append("[[responsive_search_ads]]")
+        if rsa.get("id"):
+            lines.append(f'id = "{rsa["id"]}"                          # readonly')
+        lines.append(f'ad_group_id = "{rsa["ad_group_id"]}"')
+        lines.append(f'status = "{rsa.get("status", "ENABLED")}"')
+        lines.append(f'final_url = "{_toml_escape(rsa.get("final_url", ""))}"')
+        headlines_arr = ", ".join(f'"{_toml_escape(h)}"' for h in rsa.get("headlines", []))
+        lines.append(f'headlines = [{headlines_arr}]')
+        descs_arr = ", ".join(f'"{_toml_escape(d)}"' for d in rsa.get("descriptions", []))
+        lines.append(f'descriptions = [{descs_arr}]')
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -2268,6 +2401,11 @@ def cmd_export(args):
         "campaigns": _live_campaigns_state(args.customer),
         **assets,
     }
+    if args.full:
+        state["ad_groups"] = _live_ad_groups_state(args.customer)
+        state["keywords"] = _live_keywords_state(args.customer)
+        state["asset_group_text_assets"] = _live_asset_group_text_assets_state(args.customer)
+        state["responsive_search_ads"] = _live_responsive_search_ads_state(args.customer)
     serialized = _serialize_state_toml(state)
     counts = (
         f"{len(state['campaigns'])} campaign(s), "
@@ -2275,6 +2413,13 @@ def cmd_export(args):
         f"{len(state['callouts'])} callout(s), "
         f"{len(state['snippets'])} snippet(s)"
     )
+    if args.full:
+        counts += (
+            f", {len(state['ad_groups'])} ad group(s), "
+            f"{len(state['keywords'])} keyword(s), "
+            f"{len(state['asset_group_text_assets'])} ag text-asset(s), "
+            f"{len(state['responsive_search_ads'])} RSA(s)"
+        )
     if args.output and args.output != "-":
         Path(args.output).write_text(serialized)
         print(f"Wrote {args.output}  ({counts})")
@@ -2355,15 +2500,41 @@ def _compute_diff_states(desired_state, current_state):
                     "operation": "prune",
                     "data": live_entry,
                 })
+
+    # ---- v3: ad_group_text_assets, keywords, RSAs (id-keyed, create/prune) ----
+    for plural, singular in (
+        ("keywords", "keyword"),
+        ("asset_group_text_assets", "asset_group_text_asset"),
+        ("responsive_search_ads", "responsive_search_ad"),
+    ):
+        if plural not in desired_state:
+            continue
+        desired_list = desired_state[plural]
+        live_list = current_state.get(plural, [])
+        state_ids = {e["id"] for e in desired_list if e.get("id")}
+        for entry in desired_list:
+            if not entry.get("id"):
+                changes.append({"kind": singular, "operation": "create", "data": entry})
+        for live_entry in live_list:
+            if live_entry["id"] not in state_ids:
+                changes.append({"kind": singular, "operation": "prune", "data": live_entry})
     return changes
 
 
 def _compute_diff(state_file, customer_id):
-    """Diff a state file against the live Google Ads account."""
+    """Diff a state file against the live Google Ads account. Only fetches
+    the v3 entity types if the state file mentions them — keeps the simple
+    case (campaigns + account assets) fast."""
     live_state = {
         "campaigns": _live_campaigns_state(customer_id),
         **_live_account_assets_state(customer_id),
     }
+    v3_keys = ("ad_groups", "keywords", "asset_group_text_assets", "responsive_search_ads")
+    if any(k in state_file for k in v3_keys):
+        live_state["ad_groups"] = _live_ad_groups_state(customer_id)
+        live_state["keywords"] = _live_keywords_state(customer_id)
+        live_state["asset_group_text_assets"] = _live_asset_group_text_assets_state(customer_id)
+        live_state["responsive_search_ads"] = _live_responsive_search_ads_state(customer_id)
     return _compute_diff_states(state_file, live_state)
 
 
@@ -2395,6 +2566,24 @@ def _change_summary(ch):
             return f"+  snippet   {d.get('header','')}: {', '.join(d.get('values',[]))}"
         if op == "prune":
             return f"-  snippet   [{d['id']}] {d.get('header','')}"
+    if kind == "keyword":
+        d = ch["data"]
+        if op == "create":
+            return f"+  keyword   [{d['match_type']}] '{d['text']}' → ad_group {d['ad_group_id']}"
+        if op == "prune":
+            return f"-  keyword   [{d['id']}] '{d['text']}' ({d['match_type']})"
+    if kind == "asset_group_text_asset":
+        d = ch["data"]
+        if op == "create":
+            return f"+  {d['field_type']:<13} '{d['text']}' → asset_group {d['asset_group_id']}"
+        if op == "prune":
+            return f"-  {d['field_type']:<13} [{d['id']}] '{d['text']}'"
+    if kind == "responsive_search_ad":
+        d = ch["data"]
+        if op == "create":
+            return f"+  RSA       ({len(d.get('headlines',[]))}h + {len(d.get('descriptions',[]))}d) → ad_group {d['ad_group_id']}"
+        if op == "prune":
+            return f"-  RSA       [{d['id']}] in ad_group {d['ad_group_id']}"
     return f"?  {kind} {op}"
 
 
@@ -2462,15 +2651,58 @@ def _apply_change(ch, customer_id):
             }}, customer_id)
             _link_to_customer(rn, "STRUCTURED_SNIPPET", customer_id)
             return f"created snippet '{d['header']}'"
+    if op == "create":
+        d = ch["data"]
+        if kind == "keyword":
+            ag_rn = f"customers/{customer_id}/adGroups/{d['ad_group_id']}"
+            body = {"operations": [{"create": {
+                "adGroup": ag_rn, "status": "ENABLED",
+                "keyword": {"text": d["text"], "matchType": d["match_type"]},
+            }}]}
+            api_call("POST", "adGroupCriteria:mutate", body, customer_id)
+            return f"created keyword '{d['text']}' [{d['match_type']}]"
+        if kind == "asset_group_text_asset":
+            text_rn = _create_text_asset(d["text"], customer_id)
+            _link_asset_to_group(text_rn, d["asset_group_id"], d["field_type"], customer_id)
+            return f"created {d['field_type']} '{d['text']}'"
+        if kind == "responsive_search_ad":
+            ag_rn = f"customers/{customer_id}/adGroups/{d['ad_group_id']}"
+            body = {"operations": [{"create": {
+                "adGroup": ag_rn,
+                "status": d.get("status", "ENABLED"),
+                "ad": {
+                    "finalUrls": [d["final_url"]],
+                    "responsiveSearchAd": {
+                        "headlines": [{"text": h} for h in d["headlines"]],
+                        "descriptions": [{"text": dd} for dd in d["descriptions"]],
+                    },
+                },
+            }}]}
+            api_call("POST", "adGroupAds:mutate", body, customer_id)
+            return f"created RSA in ad_group {d['ad_group_id']}"
     if op == "prune":
         d = ch["data"]
-        # Remove the customer_asset link (asset stays in library; can clean
-        # later via `gads cleanup-orphans`).
-        ft = {"sitelink": "SITELINK", "callout": "CALLOUT", "snippet": "STRUCTURED_SNIPPET"}[kind]
-        resource = f"customers/{customer_id}/customerAssets/{d['id']}~{ft}"
-        body = {"operations": [{"remove": resource}]}
-        api_call("POST", "customerAssets:mutate", body, customer_id)
-        return f"pruned {kind} [{d['id']}]"
+        if kind in ("sitelink", "callout", "snippet"):
+            ft = {"sitelink": "SITELINK", "callout": "CALLOUT", "snippet": "STRUCTURED_SNIPPET"}[kind]
+            resource = f"customers/{customer_id}/customerAssets/{d['id']}~{ft}"
+            body = {"operations": [{"remove": resource}]}
+            api_call("POST", "customerAssets:mutate", body, customer_id)
+            return f"pruned {kind} [{d['id']}]"
+        if kind == "keyword":
+            resource = f"customers/{customer_id}/adGroupCriteria/{d['ad_group_id']}~{d['id']}"
+            body = {"operations": [{"remove": resource}]}
+            api_call("POST", "adGroupCriteria:mutate", body, customer_id)
+            return f"pruned keyword [{d['id']}] '{d['text']}'"
+        if kind == "asset_group_text_asset":
+            resource = f"customers/{customer_id}/assetGroupAssets/{d['asset_group_id']}~{d['id']}~{d['field_type']}"
+            body = {"operations": [{"remove": resource}]}
+            api_call("POST", "assetGroupAssets:mutate", body, customer_id)
+            return f"unlinked {d['field_type']} [{d['id']}] from asset_group {d['asset_group_id']}"
+        if kind == "responsive_search_ad":
+            resource = f"customers/{customer_id}/adGroupAds/{d['ad_group_id']}~{d['id']}"
+            body = {"operations": [{"remove": resource}]}
+            api_call("POST", "adGroupAds:mutate", body, customer_id)
+            return f"pruned RSA [{d['id']}]"
     return f"skipped {kind} {op}"
 
 
@@ -3110,9 +3342,11 @@ def main():
     p.set_defaults(func=cmd_audit_log)
 
     p = sub.add_parser("export",
-                       help="Export live account state to a TOML file (v1: campaigns)")
+                       help="Export live account state to a TOML file")
     p.add_argument("-o", "--output", default="-",
                    help="Output file path (default: stdout)")
+    p.add_argument("--full", action="store_true",
+                   help="Also export ad groups, keywords, asset-group text assets, and RSAs (v3 schema)")
     p.set_defaults(func=cmd_export)
 
     p = sub.add_parser("plan",
