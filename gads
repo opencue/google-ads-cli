@@ -2290,16 +2290,15 @@ def _load_state_file(path):
         return tomllib.load(f)
 
 
-def _compute_diff(state_file, customer_id):
-    """Returns list of change dicts. Each has at minimum 'kind' and
-    'operation' keys. Kinds: campaign, sitelink, callout, snippet.
-    Operations: update (with field/current/desired), create (with data),
-    prune (with data), missing_in_live, only_in_live."""
+def _compute_diff_states(desired_state, current_state):
+    """Pure comparison: diff `desired_state` against `current_state`.
+    Both args are state dicts (same shape as `gads export` output).
+    Returns the same change-dict list shape as `_compute_diff`."""
     changes = []
 
     # ---- Campaigns ----
-    desired = {c["id"]: c for c in state_file.get("campaigns", [])}
-    live = {c["id"]: c for c in _live_campaigns_state(customer_id)}
+    desired = {c["id"]: c for c in desired_state.get("campaigns", [])}
+    live = {c["id"]: c for c in current_state.get("campaigns", [])}
     for cid, want in desired.items():
         have = live.get(cid)
         if not have:
@@ -2333,12 +2332,11 @@ def _compute_diff(state_file, customer_id):
     # Only diff if the state file mentions the asset kind at all — empty
     # arrays mean "I declare these explicitly", a missing key means
     # "don't manage this kind".
-    live_assets = _live_account_assets_state(customer_id)
     for kind in ("sitelinks", "callouts", "snippets"):
-        if kind not in state_file:
+        if kind not in desired_state:
             continue
-        desired_list = state_file[kind]
-        live_list = live_assets[kind]
+        desired_list = desired_state[kind]
+        live_list = current_state.get(kind, [])
         state_ids = {e["id"] for e in desired_list if e.get("id")}
 
         # CREATE: state-file entries without an id
@@ -2358,6 +2356,15 @@ def _compute_diff(state_file, customer_id):
                     "data": live_entry,
                 })
     return changes
+
+
+def _compute_diff(state_file, customer_id):
+    """Diff a state file against the live Google Ads account."""
+    live_state = {
+        "campaigns": _live_campaigns_state(customer_id),
+        **_live_account_assets_state(customer_id),
+    }
+    return _compute_diff_states(state_file, live_state)
 
 
 def _change_summary(ch):
@@ -2789,26 +2796,34 @@ def cmd_snapshot_show(args):
 
 
 def cmd_snapshot_diff(args):
-    path = _resolve_snapshot(args.snapshot)
-    if args.format != "json":
-        print(f"Diffing snapshot {path.name} vs live (customer {args.customer})...\n")
-    # Re-use the sync diff machinery — snapshot is the same TOML format
-    snapshot_state = _load_state_file(path)
-    changes = _compute_diff(snapshot_state, args.customer)
+    """Diff snapshot A against B (if given) or against live (if not)."""
+    path_a = _resolve_snapshot(args.snapshot)
+    state_a = _load_state_file(path_a)
+
+    if args.snapshot_b:
+        path_b = _resolve_snapshot(args.snapshot_b)
+        state_b = _load_state_file(path_b)
+        changes = _compute_diff_states(state_a, state_b)
+        title = f"{path_a.name} → {path_b.name}"
+        b_label = path_b.name
+    else:
+        changes = _compute_diff(state_a, args.customer)
+        title = f"{path_a.name} → live"
+        b_label = "live"
+
     if args.format == "json":
-        _emit_json({"snapshot": path.name, "changes": changes})
+        _emit_json({"a": path_a.name, "b": b_label, "changes": changes})
         return
+
     if not changes:
-        print("✓ No drift — live account matches this snapshot.")
+        print(f"✓ No drift between {title}.")
         return
-    print(f"{len(changes)} difference(s) (live vs snapshot):\n")
+
+    print(f"Diff: {title}  ({len(changes)} difference(s)):\n")
     for ch in changes:
-        if ch["field"] in ("_missing_in_live", "_only_in_live"):
-            print(f"  ⚠  {ch['field']}: campaign {ch['campaign_id']} '{ch['name']}'")
-        else:
-            print(f"  ~  '{ch['name']}' [{ch['campaign_id']}]")
-            print(f"        {ch['field']}: live={ch['current']!r}  snapshot={ch['desired']!r}")
-    print(f"\nRestore: gads snapshot restore {path.stem} --apply")
+        print(f"  {_change_summary(ch)}")
+    if not args.snapshot_b:
+        print(f"\nRestore A to live: gads snapshot restore {path_a.stem} --apply")
 
 
 def cmd_snapshot_restore(args):
@@ -3128,8 +3143,11 @@ def main():
     s_show.add_argument("snapshot", help="Snapshot stem (or 'latest', or substring match)")
     s_show.set_defaults(func=cmd_snapshot_show)
 
-    s_diff = snap_sub.add_parser("diff", help="Diff a snapshot against live state")
-    s_diff.add_argument("snapshot")
+    s_diff = snap_sub.add_parser("diff",
+                                 help="Diff snapshot vs live (default), or snapshot vs another snapshot")
+    s_diff.add_argument("snapshot", help="Snapshot stem, 'latest', or substring match")
+    s_diff.add_argument("snapshot_b", nargs="?", default=None,
+                        help="Optional second snapshot to compare against (instead of live)")
     s_diff.set_defaults(func=cmd_snapshot_diff)
 
     s_restore = snap_sub.add_parser("restore", help="Apply a snapshot back to live (uses sync)")
