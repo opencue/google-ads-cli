@@ -21,34 +21,45 @@ work in an account end-to-end.
 ## Quick start
 
 ```bash
-# 1. Auth
-gcloud auth application-default login \
-    --scopes=https://www.googleapis.com/auth/adwords,https://www.googleapis.com/auth/cloud-platform
-export GOOGLE_ADS_DEVELOPER_TOKEN=your_dev_token_here
-
-# 2. Drop the script somewhere on PATH
+# 1. Install the script
 sudo install gads /usr/local/bin/
 
-# 3. Configure your first account
-mkdir -p ~/.config/gads/profiles
-cp examples/profile.toml ~/.config/gads/profiles/myaccount.toml
-$EDITOR ~/.config/gads/profiles/myaccount.toml   # set customer_id + packs_root
+# 2. Auth (one-time, ~2 min)
+gcloud auth application-default login \
+    --scopes=https://www.googleapis.com/auth/adwords,https://www.googleapis.com/auth/cloud-platform
+export GOOGLE_ADS_DEVELOPER_TOKEN=your_dev_token_here    # add to .bashrc/.zshrc
 
-echo 'default_profile = "myaccount"' > ~/.config/gads/config.toml
+# 3. Interactive wizard — creates ~/.config/gads/profiles/<name>.toml
+gads init
 
-# 4. Read commands work immediately
+# 4. Verify everything works
+gads auth-check
+
+# 5. Now read commands work immediately
 gads list-campaigns
 gads stats --days 30
 gads stats-vs-prev --days 14         # last 14d vs prior 14d
 ```
 
+Skipping the wizard? Copy `examples/profile.toml` to
+`~/.config/gads/profiles/<name>.toml` by hand and edit. Then
+`echo 'default_profile = "<name>"' > ~/.config/gads/config.toml`.
+
 ## Commands
+
+### Onboarding / meta
+
+| Command | What it does |
+|---|---|
+| `init` | Interactive wizard to create your first profile |
+| `auth-check` | Preflight: dev token + ADC + customer reachability |
+| `commands` | JSON manifest of every command — for LLM agent discovery |
+| `list-profiles` | List configured profiles |
 
 ### Read-only
 
 | Command | What it does |
 |---|---|
-| `list-profiles` | List configured profiles |
 | `list-campaigns` | Active campaigns + budgets + bid strategy |
 | `list-conversions` | Conversion action inventory |
 | `list-recommendations` | Pending Google recommendations |
@@ -147,8 +158,11 @@ Common LLM-driven workflows:
 
 ## Roadmap
 
-- `gads cleanup-orphans` — find + delete unattached budgets/assets
 - `gads health` — one-command account dashboard
+- `gads snapshot save/list/restore` — undo support for mutations
+- `gads sync <yaml>` — Terraform-style declarative state with drift detection
+- `gads lint <pack>` — offline pack validator (width, required fields, URL HEAD)
+- Atomic multi-step via `googleAds:mutate` bulk endpoint — prevents orphans on partial failure
 - `gads report --weekly` — markdown 2-week riport from `stats-vs-prev`
 - `gads snapshot list/restore` — undo support
 - `--json` / `--csv` output flags for piping
