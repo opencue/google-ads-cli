@@ -54,9 +54,18 @@ gads-tui
 | `p`      | Toggle PAUSED ↔ ENABLED on the selected campaign      |
 | `b`      | Set daily budget on the selected campaign (text input)|
 | `s`      | Open `gads suggest` modal — prioritized fix punch list|
+| `Tab`    | Cycle to the next configured profile (multi-account)  |
 | `↑`/`k`  | Move selection up                                     |
 | `↓`/`j`  | Move selection down                                   |
 | `Ctrl+C` | Quit (same as `q`)                                    |
+
+### Multi-profile (Tab)
+
+`gads-tui` reads `gads list-profiles --format json` on startup. With
+2+ profiles configured, `Tab` cycles to the next one — the campaign
+table re-fetches, all shell-outs route through the new
+`GADS_PROFILE=<name>`. Useful for agencies / anyone managing several
+accounts from one shell.
 
 ### Budget modal
 
@@ -87,10 +96,10 @@ Only digit keys + backspace are accepted. Enter shells out to
 ## Roadmap
 
 - Asset group drill-down (Enter on selected campaign)
-- Multi-profile view: switch profiles with `Tab`
 - Live spend deltas with sparklines
 - Alerts panel: lost-IS spikes, optimization-score drops, budget hits
 - Inline `gads cleanup-orphans` / `snapshot save` from the dashboard
+- Pre-built static binaries on GitHub Releases (in progress)
 
 ## Single-binary install
 

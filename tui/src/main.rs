@@ -65,11 +65,26 @@ enum InputMode {
     },
 }
 
+#[derive(Deserialize, Clone, Debug)]
+struct ProfileInfo {
+    name: String,
+    customer_id: Option<String>,
+    is_default: bool,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+struct ProfilesPayload {
+    profiles: Vec<ProfileInfo>,
+    #[allow(dead_code)]
+    default_profile: Option<String>,
+}
+
 struct App {
     campaigns: Vec<Campaign>,
     table_state: TableState,
     last_refresh: Instant,
-    profile_name: Option<String>,
+    profiles: Vec<ProfileInfo>,
+    current_profile_idx: usize,
     status_message: String,
     refreshing: bool,
     show_suggest: bool,
@@ -83,13 +98,83 @@ impl App {
             campaigns: Vec::new(),
             table_state: TableState::default().with_selected(Some(0)),
             last_refresh: Instant::now() - REFRESH_EVERY,
-            profile_name: std::env::var("GADS_PROFILE").ok(),
+            profiles: Vec::new(),
+            current_profile_idx: 0,
             status_message: "Loading…".into(),
             refreshing: false,
             show_suggest: false,
             suggest: None,
             input_mode: None,
         }
+    }
+
+    fn current_profile_name(&self) -> Option<&str> {
+        self.profiles
+            .get(self.current_profile_idx)
+            .map(|p| p.name.as_str())
+    }
+
+    fn current_profile_customer(&self) -> Option<&str> {
+        self.profiles
+            .get(self.current_profile_idx)
+            .and_then(|p| p.customer_id.as_deref())
+    }
+
+    fn load_profiles(&mut self) -> Result<()> {
+        let out = Command::new("gads")
+            .args(["--format", "json", "list-profiles"])
+            .output()
+            .context("failed to spawn `gads list-profiles`")?;
+        if !out.status.success() {
+            self.status_message = format!(
+                "list-profiles failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+            );
+            return Ok(());
+        }
+        let parsed: ProfilesPayload =
+            serde_json::from_slice(&out.stdout).context("parsing gads list-profiles JSON")?;
+        // Seed current index: prefer the env-var profile, then default, then 0.
+        let env_profile = std::env::var("GADS_PROFILE").ok();
+        let idx = parsed
+            .profiles
+            .iter()
+            .position(|p| Some(&p.name) == env_profile.as_ref())
+            .or_else(|| parsed.profiles.iter().position(|p| p.is_default))
+            .unwrap_or(0);
+        self.profiles = parsed.profiles;
+        self.current_profile_idx = idx;
+        Ok(())
+    }
+
+    fn cycle_profile(&mut self) -> Result<()> {
+        if self.profiles.len() < 2 {
+            self.status_message = format!(
+                "Only {} profile configured — add another in ~/.config/gads/profiles/",
+                self.profiles.len()
+            );
+            return Ok(());
+        }
+        self.current_profile_idx = (self.current_profile_idx + 1) % self.profiles.len();
+        // Clear stale state and refresh
+        self.campaigns.clear();
+        self.suggest = None;
+        self.show_suggest = false;
+        let name = self.current_profile_name().unwrap_or("?").to_string();
+        self.status_message = format!("Switched to profile: {name}");
+        self.refresh()
+    }
+
+    /// Build a Command with GADS_PROFILE set to the current profile (if any).
+    fn gads_cmd(&self) -> Command {
+        let mut cmd = Command::new("gads");
+        if let Some(p) = self.current_profile_name() {
+            cmd.env("GADS_PROFILE", p);
+        }
+        cmd
     }
 
     fn start_budget_input(&mut self) {
@@ -124,7 +209,8 @@ impl App {
         };
         self.input_mode = None;
         self.status_message = format!("Setting budget on {campaign_id} → {value}…");
-        let out = Command::new("gads")
+        let out = self
+            .gads_cmd()
             .env("GADS_NO_AUTOSNAPSHOT", "1")
             .args(["set-budget", &campaign_id, "--daily", &value, "--apply"])
             .output()
@@ -161,7 +247,8 @@ impl App {
             None => return Ok(()),
         };
         self.status_message = format!("Setting campaign {id} → {new_status}…");
-        let out = Command::new("gads")
+        let out = self
+            .gads_cmd()
             .env("GADS_NO_AUTOSNAPSHOT", "1") // skip per-keypress snapshot churn
             .args(["set-status", "campaign", &id, &new_status, "--apply"])
             .output()
@@ -181,7 +268,8 @@ impl App {
 
     fn load_suggest(&mut self) -> Result<()> {
         self.status_message = "Running `gads suggest`…".into();
-        let out = Command::new("gads")
+        let out = self
+            .gads_cmd()
             .args(["--format", "json", "suggest"])
             .output()
             .context("failed to spawn `gads suggest`")?;
@@ -206,7 +294,8 @@ impl App {
 
     fn refresh(&mut self) -> Result<()> {
         self.refreshing = true;
-        let out = Command::new("gads")
+        let out = self
+            .gads_cmd()
             .args(["--format", "json", "list-campaigns"])
             .output()
             .context("failed to spawn `gads`. Is it on PATH?")?;
@@ -273,6 +362,7 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
 }
 
 fn run(terminal: &mut Term, app: &mut App) -> Result<()> {
+    app.load_profiles()?;
     app.refresh()?;
     loop {
         terminal.draw(|f| ui(f, app))?;
@@ -326,6 +416,7 @@ fn run(terminal: &mut Term, app: &mut App) -> Result<()> {
                     (KeyCode::Char('p'), _) => app.toggle_selected_status()?,
                     (KeyCode::Char('b'), _) => app.start_budget_input(),
                     (KeyCode::Char('s'), _) => app.load_suggest()?,
+                    (KeyCode::Tab, _) => app.cycle_profile()?,
                     (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.move_selection(1),
                     (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.move_selection(-1),
                     _ => {}
@@ -567,32 +658,52 @@ fn textwrap_lines(s: &str, max_width: usize) -> Vec<String> {
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
-    let profile = app
-        .profile_name
-        .as_deref()
-        .unwrap_or("(no profile — set GADS_PROFILE or default_profile)");
-    let title = format!("gads-tui · profile={profile}");
+    let profile_name = app.current_profile_name().unwrap_or("(none)");
+    let customer = app.current_profile_customer().unwrap_or("?");
+    let n = app.profiles.len();
+    let idx_label = if n > 1 {
+        format!("  [{}/{}]", app.current_profile_idx + 1, n)
+    } else {
+        String::new()
+    };
+
+    let left = Line::from(vec![
+        Span::styled(
+            " gads-tui ",
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            profile_name.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("customer={customer}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(idx_label, Style::default().fg(Color::DarkGray)),
+    ]);
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .padding(Padding::horizontal(1));
-    let p = Paragraph::new(Line::from(vec![Span::styled(
-        title,
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]))
-    .block(block);
-    f.render_widget(p, area);
+    f.render_widget(Paragraph::new(left).block(block), area);
 }
 
 fn render_table(f: &mut Frame, area: Rect, app: &App) {
-    let header_cells = ["ID", "STATUS", "TYPE", "BID", "BUDGET", "NAME"]
+    let header_cells = ["", "ID", "STATUS", "TYPE", "BIDDING", "BUDGET", "NAME"]
         .iter()
         .map(|h| {
             Cell::from(*h).style(
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
             )
         });
@@ -615,62 +726,102 @@ fn render_table(f: &mut Frame, area: Rect, app: &App) {
             let bid = c
                 .bidding_strategy_type
                 .clone()
-                .unwrap_or_else(|| "-".into());
+                .unwrap_or_else(|| "—".into());
+            // Compress long enum names so the column doesn't explode
+            let bid_short = bid
+                .replace("MAXIMIZE_CONVERSION_VALUE", "MAX CONV VAL")
+                .replace("MAXIMIZE_CONVERSIONS", "MAX CONV")
+                .replace("PERFORMANCE_MAX", "PMAX")
+                .replace("SEARCH", "Search");
+            let channel_short = c
+                .channel_type
+                .replace("PERFORMANCE_MAX", "PMAX")
+                .replace("SEARCH", "Search");
             Row::new(vec![
-                Cell::from(c.id.clone()),
+                Cell::from(Span::styled("●", Style::default().fg(status_color))),
+                Cell::from(Span::styled(
+                    c.id.clone(),
+                    Style::default().fg(Color::DarkGray),
+                )),
                 Cell::from(Span::styled(
                     c.status.clone(),
-                    Style::default().fg(status_color),
+                    Style::default()
+                        .fg(status_color)
+                        .add_modifier(Modifier::BOLD),
                 )),
-                Cell::from(c.channel_type.clone()),
-                Cell::from(bid),
-                Cell::from(budget),
+                Cell::from(channel_short),
+                Cell::from(bid_short),
+                Cell::from(Span::styled(
+                    budget,
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
                 Cell::from(c.name.clone()),
             ])
         })
         .collect();
 
     let widths = [
-        Constraint::Length(14),
-        Constraint::Length(10),
-        Constraint::Length(18),
-        Constraint::Length(27),
-        Constraint::Length(10),
+        Constraint::Length(2),
+        Constraint::Length(13),
+        Constraint::Length(8),
+        Constraint::Length(7),
+        Constraint::Length(15),
+        Constraint::Length(8),
         Constraint::Min(20),
     ];
 
     let table = Table::new(rows, widths)
         .header(header)
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▸ ")
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
                 .title(" Campaigns ")
-                .title_style(Style::default().fg(Color::Cyan)),
+                .title_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
         );
 
     f.render_stateful_widget(table, area, &mut app.table_state.clone());
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
-    let mut spans = vec![
-        Span::styled(" q ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::raw(" quit  "),
-        Span::styled(" r ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::raw(" refresh  "),
-        Span::styled(" p ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::raw(" pause/enable  "),
-        Span::styled(" b ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::raw(" budget  "),
-        Span::styled(" s ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::raw(" suggest  "),
+    fn key(label: &str) -> Span<'_> {
         Span::styled(
-            " ↑↓ ",
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-        ),
-        Span::raw(" nav  "),
+            format!(" {label} "),
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+    }
+
+    let mut spans = vec![
+        key("q"),
+        Span::raw(" quit   "),
+        key("r"),
+        Span::raw(" refresh   "),
+        key("p"),
+        Span::raw(" pause/enable   "),
+        key("b"),
+        Span::raw(" budget   "),
+        key("s"),
+        Span::raw(" suggest   "),
     ];
+    if app.profiles.len() > 1 {
+        spans.push(key("⇥"));
+        spans.push(Span::raw(" profile   "));
+    }
+    spans.push(key("↑↓"));
+    spans.push(Span::raw(" nav  "));
 
     let refresh_msg = if app.refreshing {
         " refreshing… ".to_string()
