@@ -217,22 +217,54 @@ def api_call(method, path, body=None, customer_id=None):
             msg = json.dumps(err_json, indent=2, ensure_ascii=False)
         except Exception:
             msg = err_body
-        sys.exit(f"API HIBA {e.code} {e.reason}\n{msg}")
+        hint = _hint_for_api_error(e.code, err_body)
+        sys.exit(f"API ERROR {e.code} {e.reason}\n{msg}{hint}")
+
+
+# Common Google Ads API error codes → short remediation hint.
+_ERROR_HINTS = {
+    "AUTHENTICATION_ERROR":      "Run `gcloud auth application-default login` to refresh the ADC token.",
+    "AUTHORIZATION_ERROR":       "ADC user may lack access to this customer, or login_customer_id is wrong.",
+    "DEVELOPER_TOKEN_NOT_APPROVED": "Apply for Basic Access in the Ads API Center; Test tokens block mutations on prod accounts.",
+    "DEVELOPER_TOKEN_NOT_REGISTERED": "GOOGLE_ADS_DEVELOPER_TOKEN env var is missing or wrong.",
+    "QUOTA_ERROR":               "Throttled by API quota — wait a minute and retry.",
+    "INTERNAL_ERROR":            "Transient Google-side error — retry in 30 seconds.",
+    "TOO_LONG":                  "A text field exceeds Google's character limit. en-dash/em-dash/minus count as 2 chars in Google's display-width counting.",
+    "INVALID_FORMAT":            "Check enum-valued fields (snippet header must be 'Brands', 'Types', 'Models', etc. — not arbitrary text).",
+    "RESOURCE_ALREADY_EXISTS":   "This asset/link already exists. Re-run gads list-* to see current state.",
+    "BRAND_ASSETS_NOT_LINKED_AT_CAMPAIGN_LEVEL": "PMAX Brand Guidelines: BUSINESS_NAME and LOGO must link to the campaign, not the asset group.",
+    "FIELD_ERROR":               "Required field missing. Check the API error 'fieldPathElements' to see which.",
+}
+
+
+def _hint_for_api_error(http_code, err_body):
+    for code, hint in _ERROR_HINTS.items():
+        if code in err_body:
+            return f"\n💡 Hint: {hint}"
+    if http_code == 401:
+        return "\n💡 Hint: Auth failed. `gads auth check` (once added) or re-run `gcloud auth application-default login`."
+    if http_code == 403:
+        return "\n💡 Hint: Forbidden. Check developer token approval level + login_customer_id."
+    if http_code == 429:
+        return "\n💡 Hint: Rate-limited. Wait and retry."
+    return ""
 
 
 # ─── Display helpers ──────────────────────────────────────────────────────
 
-def micros_to_huf(micros):
+def micros_to_units(micros):
+    """Format a micros value as account-currency units. Currency-agnostic
+    (Google API stores all monetary fields as micros; 1 unit = 1_000_000)."""
     if micros is None:
         return "—"
-    return f"{int(micros) / 1_000_000:.0f} HUF"
+    return f"{int(micros) / 1_000_000:.0f}"
 
 
 def dry_run_banner(action, target):
     print(f"  ╭──────────────────────────────────────────────────────────╮")
-    print(f"  │  DRY RUN — semmi nem ment fel az API-hoz                 │")
+    print(f"  │  DRY RUN — nothing was sent to the API                   │")
     print(f"  │  {action}: {target:<54.54}│")
-    print(f"  │  Re-run --apply flag-gel hogy tényleg megtörténjen.      │")
+    print(f"  │  Re-run with --apply to commit.                          │")
     print(f"  ╰──────────────────────────────────────────────────────────╯")
 
 
@@ -280,7 +312,7 @@ def cmd_list_campaigns(args):
         url_exp = "OFF" if c.get("urlExpansionOptOut") else "ON"
         print(f"{c['id']:>12}  {c['status']:<10}  {c['advertisingChannelType']:<18}  "
               f"{c.get('biddingStrategyType', '-'):<27}  "
-              f"{micros_to_huf(cb.get('amountMicros')):<14}  "
+              f"{micros_to_units(cb.get('amountMicros')):<14}  "
               f"{url_exp:<9}  {c['name']}")
 
 
@@ -1481,6 +1513,119 @@ def cmd_set_budget(args):
     print(f"OK — napi budget {args.daily} HUF on {budget_resource}")
 
 
+# ─── Orphan cleanup ───────────────────────────────────────────────────────
+
+def _orphan_budgets(customer_id):
+    """Return list of (budget_id, name) for campaign budgets with no
+    non-removed campaign referencing them (reference_count == 0)."""
+    q = """
+    SELECT
+      campaign_budget.id, campaign_budget.name,
+      campaign_budget.reference_count, campaign_budget.amount_micros
+    FROM campaign_budget
+    WHERE campaign_budget.status != 'REMOVED'
+    """
+    res = api_call("POST", "googleAds:search", {"query": q}, customer_id)
+    out = []
+    for row in res.get("results", []):
+        cb = row["campaignBudget"]
+        # reference_count comes back as a string in REST JSON
+        if int(cb.get("referenceCount", "0")) == 0:
+            out.append((cb["id"], cb.get("name", "(unnamed)"), int(cb.get("amountMicros", "0"))))
+    return out
+
+
+def _orphan_text_assets(customer_id, limit=500):
+    """Return list of (asset_id, text) for TEXT assets with no current
+    asset_group_asset, customer_asset, or campaign_asset link."""
+    # Pull all live assets of type TEXT
+    q_assets = f"""
+    SELECT asset.id, asset.text_asset.text
+    FROM asset
+    WHERE asset.type = 'TEXT'
+    LIMIT {limit}
+    """
+    res = api_call("POST", "googleAds:search", {"query": q_assets}, customer_id)
+    all_text = {row["asset"]["id"]: row["asset"]["textAsset"]["text"]
+                for row in res.get("results", [])}
+    if not all_text:
+        return []
+
+    # Pull live linked-asset IDs across the three link tables
+    linked = set()
+    for resource in ("asset_group_asset", "customer_asset", "campaign_asset"):
+        q = f"""
+        SELECT asset.id
+        FROM {resource}
+        WHERE {resource}.status != 'REMOVED'
+        """
+        try:
+            res = api_call("POST", "googleAds:search", {"query": q}, customer_id)
+            for row in res.get("results", []):
+                linked.add(row["asset"]["id"])
+        except SystemExit:
+            # Some link resources require extra fields; ignore and proceed
+            pass
+
+    return [(aid, text) for aid, text in all_text.items() if aid not in linked]
+
+
+def cmd_cleanup_orphans(args):
+    target = args.type.lower()
+    if target not in ("budget", "asset", "all"):
+        sys.exit(f"ERROR: --type must be one of: budget, asset, all")
+
+    budgets, assets = [], []
+    if target in ("budget", "all"):
+        print("Scanning for orphan campaign budgets...")
+        budgets = _orphan_budgets(args.customer)
+        print(f"  Found {len(budgets)} orphan budget(s).\n")
+        for bid, name, micros in budgets:
+            print(f"    {bid}  {micros_to_units(micros):>10} /day  {name}")
+
+    if target in ("asset", "all"):
+        print("\nScanning for orphan text assets...")
+        assets = _orphan_text_assets(args.customer)
+        print(f"  Found {len(assets)} orphan text asset(s).\n")
+        for aid, text in assets[:50]:
+            preview = text[:60] + ("..." if len(text) > 60 else "")
+            print(f"    {aid:>14}  {preview}")
+        if len(assets) > 50:
+            print(f"    ... and {len(assets) - 50} more")
+        if assets:
+            print("\n  ⚠️  This scan checks asset_group_asset, customer_asset, and")
+            print("      campaign_asset link tables. Text assets used inside RSA")
+            print("      headlines/descriptions are linked via ad_group_ad_asset_view")
+            print("      and may show as orphan here even though Google references")
+            print("      them. If you see RSA copy in this list, the API will refuse")
+            print("      to delete an in-use asset (RESOURCE_IN_USE) — safe to try.")
+
+    total = len(budgets) + len(assets)
+    if total == 0:
+        print("\n✓ No orphans found.")
+        return
+
+    if not args.apply:
+        dry_run_banner(f"DELETE {len(budgets)} budget(s) + {len(assets)} asset(s)", str(args.customer))
+        return
+
+    print(f"\nDeleting {total} orphan resource(s)...")
+    if budgets:
+        ops = [{"remove": f"customers/{args.customer}/campaignBudgets/{b[0]}"} for b in budgets]
+        api_call("POST", "campaignBudgets:mutate", {"operations": ops}, args.customer)
+        print(f"  ✓ {len(budgets)} budget(s) deleted")
+
+    if assets:
+        # Delete in batches of 100 to stay under API operation limits
+        for i in range(0, len(assets), 100):
+            batch = assets[i:i+100]
+            ops = [{"remove": f"customers/{args.customer}/assets/{a[0]}"} for a in batch]
+            api_call("POST", "assets:mutate", {"operations": ops}, args.customer)
+        print(f"  ✓ {len(assets)} asset(s) deleted")
+
+    print("\nDone. Re-run `gads cleanup-orphans` to verify.")
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────
 
 def main():
@@ -1546,6 +1691,12 @@ def main():
     p.add_argument("status", choices=["ENABLED", "PAUSED"])
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_set_status)
+
+    p = sub.add_parser("cleanup-orphans")
+    p.add_argument("--type", default="all", choices=["budget", "asset", "all"],
+                   help="What kind of orphans to clean up (default: all)")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_cleanup_orphans)
 
     p = sub.add_parser("stats")
     p.add_argument("--days", type=int, help="Utolsó N nap (alapért. 30)")
