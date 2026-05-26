@@ -5,36 +5,37 @@
 #
 # Character limits enforced: headlines 30, descriptions 90, long_headlines 90.
 # Google counts en-dash (–), em-dash (—), and minus (−) as 2 chars each.
-# Stick to ASCII hyphen-minus (-) to stay safe.
+# Stick to ASCII hyphen-minus (-) — examples below follow this rule.
 
 name             = "BrandA"
 asset_group_name = "BrandA asset group"
 final_url        = "https://www.example.com/collections/brand-a/"
 
-# 3-15 headlines. 10 is a good default.
+# 3-15 headlines. 10 is a good default — Google picks combinations dynamically.
+# Mix brand mentions, USPs, audience callouts, and specific products.
 headlines = [
   "BrandA Premium Tires",
   "Shop BrandA Direct & Save",
-  "BrandA — Built to Last",
+  "BrandA - Built to Last",
   "Trusted BrandA Dealer",
   "All BrandA Sizes In Stock",
   "BrandA Free Shipping $99+",
-  "BrandA — 30-Day Returns",
-  "BrandA Expert Advice",
+  "BrandA 30-Day Returns",
+  "Talk to a BrandA Expert",
   "Authorised BrandA Reseller",
-  "BrandA — Best Value",
+  "BrandA Best Value 2026",
 ]
 
 # 2-5 descriptions, max 90 chars each.
 descriptions = [
   "Shop the full BrandA range direct from the authorised dealer. Free shipping on $99+.",
   "BrandA tires backed by a 30-day return guarantee. Expert advice from real humans.",
-  "All BrandA sizes in stock — same-day dispatch on orders before 3pm EST.",
-  "Buy BrandA direct & save up to 25% vs retail. Mon-Fri tire expert hotline.",
+  "All BrandA sizes in stock - same-day dispatch on orders placed before 3pm EST.",
+  "Buy BrandA direct and save up to 25% vs retail. Mon-Fri tire expert hotline.",
 ]
 
 # 1-5 long headlines, max 90 chars each.
 long_headlines = [
-  "BrandA premium tires direct from the authorised dealer — free shipping nationwide",
-  "Shop BrandA & save up to 25% vs retail with 30-day return guarantee",
+  "BrandA premium tires direct from the authorised dealer with free nationwide shipping",
+  "Shop BrandA and save up to 25% vs retail with a 30-day money-back guarantee",
 ]

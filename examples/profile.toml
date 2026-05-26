@@ -3,8 +3,12 @@
 #   echo 'default_profile = "<your-account-name>"' > ~/.config/gads/config.toml
 # or pass --profile <name> to every gads invocation.
 
-customer_id = "1234567890"
-# login_customer_id = "9876543210"     # set if this account is under an MCC
+# Get this from the Google Ads UI (top-right account picker — 10 digits,
+# strip the hyphens). Must be a string, not an int.
+customer_id = "INSERT_CUSTOMER_ID_HERE"
+
+# Only set if this account is administered under a manager (MCC) account.
+# login_customer_id = "INSERT_MCC_CUSTOMER_ID_HERE"
 
 # Where pack files live. Either an absolute path or relative to this profile.
 packs_root = "/home/youruser/projects/myaccount/gads-packs"

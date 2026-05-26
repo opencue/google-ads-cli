@@ -12,59 +12,53 @@ locale, packs_root, etc. Bulk commands consume per-account TOML packs.
 All mutating commands run as DRY-RUN by default. Add --apply to commit.
 
 Commands (read-only):
-  list-campaigns                              Aktív kampányok + budget + bid stratégia
-  list-conversions                            Conversion action-ök listája
-  list-assets <asset_group_id>                Asset-ek egy asset group-ban
-  list-recommendations                        Pending Google ajánlások
-  gaql "<query>"                              Tetszőleges GAQL query (debug)
+  list-profiles                               List configured profiles
+  list-campaigns                              Active campaigns + budget + bid strategy
+  list-conversions                            Conversion actions
+  list-assets <asset_group_id>                Assets in an asset group
+  list-account-assets                         Account-level sitelinks/callouts/snippets
+  list-adgroups [--campaign ID] [--status ENABLED]
+  list-keywords [--campaign ID] [--ad-group ID] [--status ENABLED]
+  list-recommendations                        Pending Google recommendations
+  stats [--days N | --start YYYY-MM-DD --end YYYY-MM-DD] [--campaign ID]
+  stats-vs-prev --days N [--campaign ID]      Delta vs prior N days
+  gaql "<query>"                              Run any GAQL query
 
-Commands (mutating — kell --apply):
-  delete-conversion <id> [--apply]            Conversion action törlése
+Commands (mutating — dry-run unless --apply):
+  delete-conversion <id> [--apply]
   disable-url-expansion <campaign_id> [--apply]   PMAX URL expansion OFF
   enable-url-expansion <campaign_id> [--apply]    PMAX URL expansion ON
   set-bid <campaign_id> --strategy <S> [--target <X>] [--apply]
-      Bid strategy váltás. S ∈ {TARGET_CPA, TARGET_ROAS,
-      MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE}
-      --target CPA esetén HUF, ROAS esetén szám (pl. 4.0 = 4x)
-  set-budget <campaign_id> --daily <HUF> [--apply]    Napi budget HUF-ban
+      S ∈ {TARGET_CPA, TARGET_ROAS, MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE}
+  set-budget <campaign_id> --daily <amount> [--apply]    daily budget in account currency
+  set-status <resource_type> <id> {ENABLED|PAUSED} [--apply]
+      resource_type ∈ {campaign, ad_group, asset_group}
 
-Commands (performance — read-only):
-  stats [--days N | --start YYYY-MM-DD --end YYYY-MM-DD] [--campaign ID]
-      Kampány-szintű KPI-k egy időszakra (cost, imp, clicks, ctr, cpc, conv,
-      conv_value, IS, lost_is_budget, lost_is_rank).
-  stats-vs-prev --days N [--campaign ID]
-      Utolsó N nap vs előző N nap delta táblázat — 2-hetes riportokhoz.
-  list-adgroups [--campaign ID] [--status ENABLED]
-      Ad group-ok listája — Brand Search kampány előkészítéséhez.
-  list-keywords [--campaign ID] [--ad-group ID] [--status ENABLED]
-      Keyword-ök match-type-pal, quality score-val, bid-del.
-
-Commands (account-level asset extensions):
-  list-account-assets                         Aktuális account-level sitelink/callout/snippet-ek
   add-sitelink <text> <url> [--d1 <s>] [--d2 <s>] [--apply]
-      Sitelink + customer link. text max 25, d1/d2 max 35 kar.
-  add-callout <text> [--apply]                Callout asset (text max 25 kar)
-  add-snippet <header> <val>... [--apply]     Structured snippet (min 3 érték)
-  seed-account-assets [--apply]               Bulk: 6 sitelink + 6 callout + Stílus snippet
-      Az implementation-pack §A.4–A.6 alapján. Idempotens check:
-      ha már van bármilyen account-level asset, figyelmeztet.
+  add-callout <text> [--apply]
+  add-snippet <header> <v1> <v2> <v3>... [--apply]   header must be a Google enum
+  seed-account-assets --pack <file> [--apply]        bulk sitelinks/callouts/snippets
 
-Commands (asset group + campaign creation):
-  replace-headlines <asset_group_id> --pack {superway|hubtrac|szerelo} [--apply]
-      Headline pack csere atomic batch-csel (12 remove + 10 add egy hívásban).
-      Implementation-pack §A.1 alapján.
-  create-brand-campaign [--name <s>] [--budget <HUF>] [--final-url <url>] [--apply]
-      Új Brand Search kampány: budget + campaign + geo + ad group + keywords + RSA.
-      PAUSED állapotban jön létre — review után te enabled-eled.
+  add-text-assets <ag_id> --field-type {HEADLINE|DESCRIPTION|LONG_HEADLINE|BUSINESS_NAME} "<t1>"... [--apply]
+  add-business-name <ag_id> <name> [--apply]
+  upload-image <ag_id> <file> --field-type <ft> [--name <s>] [--apply]
+  add-youtube-video <ag_id> <video_id_or_url> [--name <s>] [--apply]
 
-Példák:
+  replace-headlines <asset_group_id> --pack <file> [--apply]
+      Atomic remove old + add new headlines from a brand pack TOML
+  create-brand-campaign --pack <file> [--apply]
+      Full Search campaign (budget + geo + ad group + keywords + RSA), PAUSED on create
+  split-asset-group <source_ag> --brand-packs <p1,p2,p3> [--apply]
+      Spawn N new asset groups from brand pack TOMLs (images copied from source)
+
+Examples:
+  gads list-profiles
   gads list-campaigns
-  gads list-conversions
-  gads delete-conversion 7617152372              # dry-run
-  gads delete-conversion 7617152372 --apply      # tényleg törli
-  gads disable-url-expansion 23857652151 --apply
-  gads set-bid 23857652151 --strategy TARGET_CPA --target 5000 --apply
-  gads set-budget 23857652151 --daily 5000 --apply
+  gads stats --days 30
+  gads stats-vs-prev --days 14
+  gads delete-conversion <conversion_id> --apply
+  gads set-budget <campaign_id> --daily 5000 --apply
+  gads set-status campaign <campaign_id> ENABLED --apply
 """
 
 import argparse
@@ -143,7 +137,7 @@ def _resolve_customer(args):
 def _load_pack(pack_arg, profile=None):
     """Load a pack TOML. `pack_arg` is the value passed to --pack; can be an
     absolute path, a relative path (resolved against profile.packs_root), or
-    a bare name like 'superway' (resolved as <packs_root>/<name>.toml or
+    a bare name like 'brand-a' (resolved as <packs_root>/<name>.toml or
     <packs_root>/brands/<name>.toml)."""
     if not pack_arg:
         sys.exit("ERROR: --pack kötelező ennél a parancsnál.")
@@ -1436,6 +1430,33 @@ def cmd_seed_account_assets(args):
     print("\nDone. Verify: gads list-account-assets")
 
 
+_STATUS_RESOURCES = {
+    "campaign":    ("campaigns",    "campaigns:mutate"),
+    "ad_group":    ("adGroups",     "adGroups:mutate"),
+    "asset_group": ("assetGroups",  "assetGroups:mutate"),
+}
+
+
+def cmd_set_status(args):
+    if args.resource_type not in _STATUS_RESOURCES:
+        sys.exit(f"ERROR: resource_type must be one of {list(_STATUS_RESOURCES)}")
+    new_status = args.status.upper()
+    if new_status not in ("ENABLED", "PAUSED"):
+        sys.exit(f"ERROR: status must be ENABLED or PAUSED")
+    coll, endpoint = _STATUS_RESOURCES[args.resource_type]
+    resource = f"customers/{args.customer}/{coll}/{args.resource_id}"
+    body = {"operations": [{
+        "update": {"resourceName": resource, "status": new_status},
+        "updateMask": "status",
+    }]}
+    if not args.apply:
+        dry_run_banner(f"SET STATUS → {new_status}", resource)
+        print(json.dumps(body, indent=2))
+        return
+    api_call("POST", endpoint, body, args.customer)
+    print(f"OK — {args.resource_type} {args.resource_id} → {new_status}")
+
+
 def cmd_set_budget(args):
     # Need to fetch the budget resource for this campaign first
     q = f"SELECT campaign_budget.resource_name FROM campaign WHERE campaign.id = {args.campaign_id}"
@@ -1514,9 +1535,17 @@ def main():
 
     p = sub.add_parser("set-budget")
     p.add_argument("campaign_id")
-    p.add_argument("--daily", required=True, help="Napi budget HUF-ban")
+    p.add_argument("--daily", required=True, help="Daily budget in account currency")
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_set_budget)
+
+    p = sub.add_parser("set-status")
+    p.add_argument("resource_type", choices=list(_STATUS_RESOURCES),
+                   help="What to toggle: campaign, ad_group, or asset_group")
+    p.add_argument("resource_id", help="Numeric ID of the resource")
+    p.add_argument("status", choices=["ENABLED", "PAUSED"])
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_set_status)
 
     p = sub.add_parser("stats")
     p.add_argument("--days", type=int, help="Utolsó N nap (alapért. 30)")
@@ -1546,7 +1575,7 @@ def main():
 
     p = sub.add_parser("add-sitelink")
     p.add_argument("text", help="Link szöveg, max 25 kar")
-    p.add_argument("url", help="Final URL, pl. https://teherguminet.hu/hu/superway")
+    p.add_argument("url", help="Final URL, e.g. https://www.example.com/category-x")
     p.add_argument("--d1", help="Description 1 (max 35 kar)")
     p.add_argument("--d2", help="Description 2 (max 35 kar)")
     p.add_argument("--apply", action="store_true")

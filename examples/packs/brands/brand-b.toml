@@ -1,10 +1,13 @@
+# Industrial / B2B-focused brand pack — counterpart to brand-a.toml.
+# Demonstrates a different audience tone and product positioning.
+
 name             = "BrandB"
 asset_group_name = "BrandB asset group"
 final_url        = "https://www.example.com/collections/brand-b/"
 
 headlines = [
   "BrandB Industrial Tires",
-  "BrandB — Heavy Duty",
+  "BrandB Heavy Duty Range",
   "BrandB Fleet Solutions",
   "BrandB for Trucks & Vans",
   "BrandB Long-Haul Series",
@@ -12,17 +15,17 @@ headlines = [
   "BrandB Authorised Dealer",
   "BrandB Free Quote in 60s",
   "BrandB Bulk Order Discount",
-  "BrandB — Built for Work",
+  "BrandB Built for Work",
 ]
 
 descriptions = [
-  "BrandB tires for trucks, vans & fleets. Bulk pricing available, fast nationwide ship.",
-  "Industrial-grade BrandB range — long-haul, all-season, off-road variants in stock.",
+  "BrandB tires for trucks, vans and fleets. Bulk pricing available, fast nationwide ship.",
+  "Industrial-grade BrandB range: long-haul, all-season, and off-road variants in stock.",
   "Free fleet quote in 60 seconds. BrandB bulk-order discount kicks in at 8 units.",
-  "BrandB authorised dealer — full warranty, no grey-market imports. Expert advice.",
+  "BrandB authorised dealer with full warranty, no grey-market imports. Expert advice.",
 ]
 
 long_headlines = [
-  "BrandB industrial tires for fleets — bulk pricing, free nationwide delivery",
-  "Get a BrandB fleet quote in 60 seconds — 8+ units gets bulk-order pricing",
+  "BrandB industrial tires for fleets with bulk pricing and free nationwide delivery",
+  "Get a BrandB fleet quote in 60 seconds - 8+ units triggers bulk-order pricing",
 ]

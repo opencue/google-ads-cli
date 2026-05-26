@@ -13,14 +13,14 @@ Both are TOML files.
 ~/.config/gads/
 ├── config.toml                     # global: default profile
 └── profiles/
-    ├── teherguminet.toml           # one TOML per Google Ads account
+    ├── myaccount.toml              # one TOML per Google Ads account
     └── otheraccount.toml
 ```
 
 ### `~/.config/gads/config.toml`
 
 ```toml
-default_profile = "teherguminet"
+default_profile = "myaccount"
 ```
 
 When you don't pass `--profile <name>` and `GADS_PROFILE` env var isn't
@@ -29,8 +29,8 @@ set, the CLI loads the `default_profile`.
 ### `~/.config/gads/profiles/<name>.toml`
 
 ```toml
-customer_id = "1234567890"
-# login_customer_id = "9876543210"      # set if account is under an MCC
+customer_id = "INSERT_CUSTOMER_ID_HERE"
+# login_customer_id = "INSERT_MCC_CUSTOMER_ID_HERE"   # only if under an MCC
 
 packs_root = "/abs/path/to/pack/files"
 

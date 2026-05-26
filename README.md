@@ -79,6 +79,7 @@ gads stats-vs-prev --days 14         # last 14d vs prior 14d
 | `disable-url-expansion <campaign_id>` / `enable-url-expansion` | PMAX URL expansion toggle |
 | `set-bid <campaign_id> --strategy <S> [--target <X>]` | Change bid strategy |
 | `set-budget <campaign_id> --daily <amount>` | Change daily budget |
+| `set-status <campaign\|ad_group\|asset_group> <id> {ENABLED\|PAUSED}` | Enable / pause a resource |
 
 ## Profiles + packs
 
@@ -88,8 +89,8 @@ files live.
 
 ```toml
 # ~/.config/gads/profiles/myaccount.toml
-customer_id = "1234567890"
-# login_customer_id = "9876543210"     # set if account is under an MCC
+customer_id = "INSERT_CUSTOMER_ID_HERE"
+# login_customer_id = "INSERT_MCC_CUSTOMER_ID_HERE"   # only if under an MCC
 
 packs_root = "/home/user/projects/myaccount/gads-packs"
 
@@ -147,7 +148,6 @@ Common LLM-driven workflows:
 ## Roadmap
 
 - `gads cleanup-orphans` — find + delete unattached budgets/assets
-- `gads set-status <campaign|adgroup|asset_group> {ENABLED|PAUSED}`
 - `gads health` — one-command account dashboard
 - `gads report --weekly` — markdown 2-week riport from `stats-vs-prev`
 - `gads snapshot list/restore` — undo support
