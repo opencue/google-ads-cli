@@ -319,6 +319,10 @@ _COMMANDS_MANIFEST = [
     ("export",                   "read",   False, "Export live account state to TOML (campaigns v1)", "gads export -o state.toml"),
     ("plan",                     "read",   False, "Diff state TOML vs live (read-only)",     "gads plan state.toml"),
     ("sync",                     "mutate", True,  "Apply state TOML changes (v1: status+budget)", "gads sync state.toml --apply"),
+    ("snapshot save",            "mutate", True,  "Capture current account state to ~/.gads/snapshots/", "gads snapshot save before-ramp"),
+    ("snapshot list",            "read",   False, "List all snapshots",                     "gads snapshot list"),
+    ("snapshot diff",            "read",   False, "Diff a snapshot against live",           "gads snapshot diff latest"),
+    ("snapshot restore",         "mutate", True,  "Restore a snapshot to live (uses sync)", "gads snapshot restore latest --apply"),
 ]
 
 
@@ -2301,6 +2305,135 @@ def cmd_sync(args):
     print(f"\nSynced. Run `gads plan {args.state_file}` to verify drift is gone.")
 
 
+# ─── Snapshots: save / list / diff / restore ──────────────────────────────
+#
+# A snapshot is just an export TOML written to ~/.gads/snapshots/. They
+# auto-save before every --apply mutation so you have a rollback path.
+# Restore is the same code path as `sync` — a snapshot file IS a state file.
+
+_MUTATING_COMMANDS = {
+    "delete-conversion", "disable-url-expansion", "enable-url-expansion",
+    "set-bid", "set-budget", "set-status",
+    "add-sitelink", "add-callout", "add-snippet", "seed-account-assets",
+    "add-text-assets", "add-business-name", "upload-image", "add-youtube-video",
+    "replace-headlines", "create-brand-campaign", "split-asset-group",
+    "cleanup-orphans", "sync",
+}
+
+
+def _snapshot_dir():
+    d = Path.home() / ".gads" / "snapshots"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _make_snapshot(customer_id, label=None, silent=False):
+    """Capture current state to ~/.gads/snapshots/<ts>[-<label>].toml.
+    Returns the snapshot Path."""
+    state = {
+        "account": {"customer_id": customer_id},
+        "campaigns": _live_campaigns_state(customer_id),
+    }
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_label = "".join(c if c.isalnum() or c in "-_" else "_" for c in (label or ""))
+    name = f"{ts}-{safe_label}.toml" if safe_label else f"{ts}.toml"
+    path = _snapshot_dir() / name
+    path.write_text(_serialize_state_toml(state))
+    if not silent:
+        print(f"  📸 snapshot: {path.name}  ({len(state['campaigns'])} campaign(s))")
+    return path
+
+
+def _snapshot_list():
+    """Returns list of Path objects sorted newest-first."""
+    return sorted(_snapshot_dir().glob("*.toml"), reverse=True)
+
+
+def _resolve_snapshot(arg):
+    """Resolve a snapshot reference: full filename, label suffix, or `latest`."""
+    snapshots = _snapshot_list()
+    if not snapshots:
+        sys.exit("ERROR: no snapshots found in ~/.gads/snapshots/")
+    if arg == "latest":
+        return snapshots[0]
+    # Exact match (stem or filename)
+    for s in snapshots:
+        if s.stem == arg or s.name == arg:
+            return s
+    # Suffix / substring match
+    matches = [s for s in snapshots if arg in s.stem]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        sys.exit(f"ERROR: no snapshot matches '{arg}'. Run `gads snapshot list`.")
+    sys.exit(f"ERROR: ambiguous '{arg}' matches {len(matches)} snapshots: "
+             + ", ".join(s.name for s in matches[:5]))
+
+
+def cmd_snapshot_save(args):
+    _make_snapshot(args.customer, args.label, silent=False)
+
+
+def cmd_snapshot_list(args):
+    snapshots = _snapshot_list()
+    if args.format == "json":
+        out = []
+        for s in snapshots:
+            stat = s.stat()
+            out.append({
+                "name": s.stem,
+                "path": str(s),
+                "size_bytes": stat.st_size,
+                "mtime": datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            })
+        _emit_json(out)
+        return
+    if not snapshots:
+        print(f"No snapshots yet. Take one: gads snapshot save [<label>]")
+        return
+    print(f"{'NAME':<40}  {'SIZE':>7}  WHEN")
+    print("-" * 100)
+    for s in snapshots:
+        stat = s.stat()
+        when = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+        print(f"{s.stem:<40}  {stat.st_size:>6}B  {when}")
+
+
+def cmd_snapshot_show(args):
+    path = _resolve_snapshot(args.snapshot)
+    sys.stdout.write(path.read_text())
+
+
+def cmd_snapshot_diff(args):
+    path = _resolve_snapshot(args.snapshot)
+    if args.format != "json":
+        print(f"Diffing snapshot {path.name} vs live (customer {args.customer})...\n")
+    # Re-use the sync diff machinery — snapshot is the same TOML format
+    snapshot_state = _load_state_file(path)
+    changes = _compute_diff(snapshot_state, args.customer)
+    if args.format == "json":
+        _emit_json({"snapshot": path.name, "changes": changes})
+        return
+    if not changes:
+        print("✓ No drift — live account matches this snapshot.")
+        return
+    print(f"{len(changes)} difference(s) (live vs snapshot):\n")
+    for ch in changes:
+        if ch["field"] in ("_missing_in_live", "_only_in_live"):
+            print(f"  ⚠  {ch['field']}: campaign {ch['campaign_id']} '{ch['name']}'")
+        else:
+            print(f"  ~  '{ch['name']}' [{ch['campaign_id']}]")
+            print(f"        {ch['field']}: live={ch['current']!r}  snapshot={ch['desired']!r}")
+    print(f"\nRestore: gads snapshot restore {path.stem} --apply")
+
+
+def cmd_snapshot_restore(args):
+    path = _resolve_snapshot(args.snapshot)
+    # Just call sync with the snapshot as the state file
+    args.state_file = str(path)
+    cmd_sync(args)
+
+
 # ─── Orphan cleanup ───────────────────────────────────────────────────────
 
 def _orphan_budgets(customer_id):
@@ -2525,6 +2658,30 @@ def main():
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_sync)
 
+    snap = sub.add_parser("snapshot",
+                          help="Save / list / diff / restore account state snapshots")
+    snap_sub = snap.add_subparsers(dest="snap_action", required=True)
+
+    s_save = snap_sub.add_parser("save", help="Capture current state as a new snapshot")
+    s_save.add_argument("label", nargs="?", default=None,
+                        help="Optional label tag (e.g. 'pre-ramp', 'monday-baseline')")
+    s_save.set_defaults(func=cmd_snapshot_save)
+
+    snap_sub.add_parser("list", help="List all snapshots").set_defaults(func=cmd_snapshot_list)
+
+    s_show = snap_sub.add_parser("show", help="Print snapshot file contents")
+    s_show.add_argument("snapshot", help="Snapshot stem (or 'latest', or substring match)")
+    s_show.set_defaults(func=cmd_snapshot_show)
+
+    s_diff = snap_sub.add_parser("diff", help="Diff a snapshot against live state")
+    s_diff.add_argument("snapshot")
+    s_diff.set_defaults(func=cmd_snapshot_diff)
+
+    s_restore = snap_sub.add_parser("restore", help="Apply a snapshot back to live (uses sync)")
+    s_restore.add_argument("snapshot")
+    s_restore.add_argument("--apply", action="store_true")
+    s_restore.set_defaults(func=cmd_snapshot_restore)
+
     p = sub.add_parser("cleanup-orphans")
     p.add_argument("--type", default="all", choices=["budget", "asset", "all"],
                    help="What kind of orphans to clean up (default: all)")
@@ -2641,6 +2798,21 @@ def main():
     _no_customer = ("list-profiles", "commands", "init", "auth-check")
     if args.cmd not in _no_customer:
         args.customer = _resolve_customer(args)
+
+    # Auto-snapshot before any --apply mutation. Skip if user disabled it
+    # explicitly via GADS_NO_AUTOSNAPSHOT, or if the command itself is a
+    # snapshot operation (avoids recursion).
+    is_mutating_apply = (
+        args.cmd in _MUTATING_COMMANDS
+        and getattr(args, "apply", False)
+        and not os.environ.get("GADS_NO_AUTOSNAPSHOT")
+    )
+    if is_mutating_apply:
+        try:
+            _make_snapshot(args.customer, label=f"pre-{args.cmd}", silent=False)
+        except Exception as e:
+            print(f"  ⚠  Auto-snapshot failed: {e}  (proceeding anyway)")
+
     args.func(args)
 
 
