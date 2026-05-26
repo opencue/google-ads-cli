@@ -295,6 +295,7 @@ _COMMANDS_MANIFEST = [
     ("commands",             "meta",   False, "Self-describing command manifest",          "gads commands"),
     ("init",                 "meta",   False, "Interactive wizard to create your first profile", "gads init"),
     ("auth-check",           "meta",   False, "Preflight: dev token + ADC + customer reach","gads auth-check"),
+    ("mcp serve",            "meta",   False, "MCP server bridge (read-only by default)", "gads mcp serve"),
 
     ("add-sitelink",         "mutate", True,  "Create single account-level sitelink",      "gads add-sitelink \"My Link\" https://example.com/page --apply"),
     ("add-callout",          "mutate", True,  "Create single account-level callout",       "gads add-callout \"Free shipping\" --apply"),
@@ -3531,6 +3532,172 @@ def cmd_cleanup_orphans(args):
     print("\nDone. Re-run `gads cleanup-orphans` to verify.")
 
 
+# ─── MCP server bridge ────────────────────────────────────────────────────
+#
+# `gads mcp serve` runs a minimal Model Context Protocol server over
+# stdio. Lets Claude Code, Cursor, Codex etc. drive gads via the
+# standard MCP wire format instead of shelling out.
+#
+# We expose the safe read-only commands as MCP tools by default; mutate
+# commands are gated behind `--allow-mutations` so an agent can't pause
+# a campaign without the human explicitly opting in.
+
+# Each tool spec:
+#   subcmd: list of args BEFORE any flag args (subcommand name + positionals)
+#   args:   ordered list of (positional_or_flag_name, kind="positional"|"flag")
+#   json:   whether to add `--format json` as a top-level flag
+#   apply:  whether to add `--apply` (mutations only)
+_MCP_READ_TOOLS = {
+    "list_campaigns":    {"subcmd": ["list-campaigns"], "args": [], "json": True},
+    "list_conversions":  {"subcmd": ["list-conversions"], "args": [], "json": False},
+    "list_account_assets": {"subcmd": ["list-account-assets"], "args": [], "json": True},
+    "list_adgroups":     {"subcmd": ["list-adgroups"], "args": [("campaign","flag"), ("status","flag")], "json": True},
+    "list_keywords":     {"subcmd": ["list-keywords"], "args": [("campaign","flag"), ("ad_group","flag"), ("status","flag")], "json": True},
+    "list_negative_keywords": {"subcmd": ["list-negative-keywords"], "args": [("campaign","flag")], "json": True},
+    "list_search_terms": {"subcmd": ["list-search-terms"], "args": [("campaign","flag"), ("days","flag"), ("limit","flag")], "json": True},
+    "stats":             {"subcmd": ["stats"], "args": [("days","flag"), ("start","flag"), ("end","flag"), ("campaign","flag")], "json": True},
+    "stats_vs_prev":     {"subcmd": ["stats-vs-prev"], "args": [("days","flag"), ("campaign","flag")], "json": True},
+    "health":            {"subcmd": ["health"], "args": [], "json": True},
+    "suggest":           {"subcmd": ["suggest"], "args": [], "json": True},
+    "audit_log":         {"subcmd": ["audit-log"], "args": [("tail","flag")], "json": True},
+    "snapshot_list":     {"subcmd": ["snapshot", "list"], "args": [], "json": True},
+    "asset_performance": {"subcmd": ["asset-performance"], "args": [("asset_group","flag")], "json": True},
+}
+
+_MCP_MUTATE_TOOLS = {
+    "set_status":        {"subcmd": ["set-status"], "args": [("resource_type","positional"), ("resource_id","positional"), ("status","positional")], "apply": True, "json": False},
+    "set_budget":        {"subcmd": ["set-budget"], "args": [("campaign_id","positional"), ("daily","flag")], "apply": True, "json": False},
+    "add_negative_keyword": {"subcmd": ["add-negative-keyword"], "args": [("campaign","positional"), ("text","positional"), ("match_type","flag")], "apply": True, "json": False},
+    "snapshot_save":     {"subcmd": ["snapshot", "save"], "args": [("label","positional")], "apply": False, "json": False},
+}
+
+
+def _mcp_run(tool_name, params, allow_mutations):
+    """Invoke gads as a subprocess and capture JSON output."""
+    spec = _MCP_READ_TOOLS.get(tool_name) or (
+        _MCP_MUTATE_TOOLS.get(tool_name) if allow_mutations else None
+    )
+    if not spec:
+        return {"error": f"unknown tool '{tool_name}'"}
+    script_path = os.path.abspath(sys.argv[0])
+
+    # Argument order matters: top-level flags BEFORE subcommand.
+    argv = [script_path]
+    if spec.get("json"):
+        argv.extend(["--format", "json"])
+    argv.extend(spec["subcmd"])
+
+    # Positionals first (in declared order), then flags
+    for argname, kind in spec.get("args", []):
+        v = params.get(argname)
+        if v is None or v == "":
+            continue
+        if kind == "positional":
+            argv.append(str(v))
+        else:
+            argv.extend([f"--{argname.replace('_', '-')}", str(v)])
+    if spec.get("apply"):
+        argv.append("--apply")
+
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, check=False)
+        return {
+            "stdout": out.stdout,
+            "stderr": out.stderr,
+            "exit_code": out.returncode,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _mcp_tool_definitions(allow_mutations):
+    """Build the JSON list returned by MCP tools/list."""
+    def _schema(spec):
+        return {
+            "type": "object",
+            "properties": {
+                argname: {"type": "string"}
+                for (argname, _kind) in spec.get("args", [])
+            },
+        }
+
+    tools = []
+    for name, spec in _MCP_READ_TOOLS.items():
+        tools.append({
+            "name": name,
+            "description": f"Read-only: gads {' '.join(spec['subcmd'])}",
+            "inputSchema": _schema(spec),
+        })
+    if allow_mutations:
+        for name, spec in _MCP_MUTATE_TOOLS.items():
+            tools.append({
+                "name": name,
+                "description": f"Mutation (auto-snapshotted): gads {' '.join(spec['subcmd'])}",
+                "inputSchema": _schema(spec),
+            })
+    return tools
+
+
+def cmd_mcp(args):
+    """Speak Model Context Protocol over stdio. One JSON-RPC message per
+    line on stdin; one response per line on stdout. Implements the
+    minimum surface: initialize, tools/list, tools/call."""
+    allow_mut = args.allow_mutations
+    sys.stderr.write(
+        f"gads-mcp ready · "
+        f"{len(_MCP_READ_TOOLS)} read + "
+        f"{len(_MCP_MUTATE_TOOLS) if allow_mut else 0} write tool(s) exposed\n"
+    )
+    sys.stderr.flush()
+
+    for raw in sys.stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            msg = json.loads(raw)
+        except Exception as e:
+            sys.stdout.write(json.dumps({
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32700, "message": f"parse error: {e}"}}) + "\n")
+            sys.stdout.flush()
+            continue
+
+        msg_id = msg.get("id")
+        method = msg.get("method")
+        params = msg.get("params") or {}
+
+        if method == "initialize":
+            resp = {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {"name": "gads-mcp", "version": "0.1.0"},
+                "capabilities": {"tools": {}},
+            }
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": resp}) + "\n")
+        elif method == "tools/list":
+            sys.stdout.write(json.dumps({
+                "jsonrpc": "2.0", "id": msg_id,
+                "result": {"tools": _mcp_tool_definitions(allow_mut)},
+            }) + "\n")
+        elif method == "tools/call":
+            tool_name = params.get("name")
+            tool_args = params.get("arguments") or {}
+            result = _mcp_run(tool_name, tool_args, allow_mut)
+            sys.stdout.write(json.dumps({
+                "jsonrpc": "2.0", "id": msg_id,
+                "result": {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]},
+            }) + "\n")
+        elif method == "notifications/initialized":
+            # No-op notification; no response expected.
+            pass
+        else:
+            sys.stdout.write(json.dumps({
+                "jsonrpc": "2.0", "id": msg_id,
+                "error": {"code": -32601, "message": f"method not found: {method}"},
+            }) + "\n")
+        sys.stdout.flush()
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────
 
 def main():
@@ -3557,6 +3724,14 @@ def main():
     p.add_argument("--skip-customer", action="store_true",
                    help="Don't try to reach the API; just check env + ADC")
     p.set_defaults(func=cmd_auth_check)
+
+    mcp = sub.add_parser("mcp", help="Model Context Protocol server bridge")
+    mcp_sub = mcp.add_subparsers(dest="mcp_action", required=True)
+    m_serve = mcp_sub.add_parser("serve",
+                                  help="Speak MCP over stdio (read-only by default)")
+    m_serve.add_argument("--allow-mutations", action="store_true",
+                          help="Also expose mutating tools (set-status, set-budget, etc.)")
+    m_serve.set_defaults(func=cmd_mcp)
     sub.add_parser("list-campaigns").set_defaults(func=cmd_list_campaigns)
     sub.add_parser("list-conversions").set_defaults(func=cmd_list_conversions)
     sub.add_parser("list-recommendations").set_defaults(func=cmd_list_recommendations)
@@ -3841,7 +4016,7 @@ def main():
 
     args = parser.parse_args()
     # These commands don't need a customer; everything else does.
-    _no_customer = ("list-profiles", "commands", "init", "auth-check")
+    _no_customer = ("list-profiles", "commands", "init", "auth-check", "mcp")
     if args.cmd not in _no_customer:
         args.customer = _resolve_customer(args)
 
