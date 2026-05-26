@@ -137,10 +137,19 @@ gads seed-account-assets --pack account-assets --apply
 
 ## Using `gads` from Claude Code
 
-`gads` is designed to be driven by LLM agents. Drop a skill file at
-`~/.claude/skills/gads-cli/SKILL.md` (template in `docs/`). After that,
-Claude Code sessions auto-discover the CLI and pick it over walking
-through the Ads UI step-by-step.
+`gads` is designed to be driven by LLM agents. Drop the bundled
+`skills/gads-cli/SKILL.md` into `~/.claude/skills/` and Claude Code
+will auto-discover it.
+
+```bash
+cp -r skills/gads-cli ~/.claude/skills/
+```
+
+Or install the whole bundle of 8 marketing/ads skills that pair with
+`gads` — see [skills/README.md](skills/README.md).
+
+After install, Claude Code prefers the CLI over walking you through the
+Ads UI step-by-step.
 
 Common LLM-driven workflows:
 
