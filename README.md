@@ -165,6 +165,20 @@ Common LLM-driven workflows:
 - Character widths follow Google's display-width counting (en-dash and minus
   count as 2), not Python `len()` — caught at validation time.
 
+## Live terminal dashboard (`gads-tui`)
+
+A Rust companion binary that reads from `gads --format json list-campaigns`
+and shows a live, auto-refreshing dashboard. See [`tui/README.md`](tui/README.md).
+
+```bash
+cd tui
+cargo build --release
+./target/release/gads-tui
+```
+
+Builds to a ~650KB stripped static binary. The Python CLI stays
+zero-dep; the TUI is opt-in and only needed if you want the live view.
+
 ## Roadmap
 
 - `gads health` — one-command account dashboard

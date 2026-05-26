@@ -1,0 +1,25 @@
+[package]
+name = "gads-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Live terminal dashboard for Google Ads accounts — reads from the gads CLI"
+license = "MIT"
+authors = ["NagyVikt"]
+repository = "https://github.com/NagyVikt/google-ads-cli"
+
+[[bin]]
+name = "gads-tui"
+path = "src/main.rs"
+
+[dependencies]
+ratatui    = "0.29"
+crossterm  = "0.28"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow     = "1"
+
+[profile.release]
+strip = true
+opt-level = "z"   # optimise for size — single-binary distribution
+lto = true
+codegen-units = 1

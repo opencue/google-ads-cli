@@ -9,6 +9,10 @@ __pycache__/
 .venv/
 venv/
 
+# Rust (TUI)
+tui/target/
+**/*.rs.bk
+
 # Editor / OS
 .vscode/
 .idea/
