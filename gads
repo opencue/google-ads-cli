@@ -326,6 +326,13 @@ _COMMANDS_MANIFEST = [
     ("snapshot prune",           "mutate", True,  "Delete old local snapshots (no API)",    "gads snapshot prune --older-than 7d --apply"),
     ("health",                   "read",   False, "Single-command account dashboard",        "gads health"),
     ("audit-log",                "read",   False, "Recent --apply mutations from ~/.gads/audit.log", "gads audit-log --tail 20"),
+    ("list-negative-keywords",   "read",   False, "Campaign-level negative keywords",        "gads list-negative-keywords"),
+    ("add-negative-keyword",     "mutate", True,  "Add a campaign-level negative keyword",   "gads add-negative-keyword <campaign_id> 'used' --match-type PHRASE --apply"),
+    ("remove-negative-keyword",  "mutate", True,  "Remove a campaign-level negative keyword","gads remove-negative-keyword <campaign_id> <criterion_id> --apply"),
+    ("list-search-terms",        "read",   False, "What users actually searched (last N days)", "gads list-search-terms --days 30"),
+    ("apply-recommendation",     "mutate", True,  "Apply a Google-generated recommendation", "gads apply-recommendation <resource_name> --apply"),
+    ("asset-performance",        "read",   False, "Top vs bottom assets by performance label", "gads asset-performance --asset-group <id>"),
+    ("create-conversion-action", "mutate", True,  "Create a new conversion action",          "gads create-conversion-action --name Purchase --type WEBPAGE --category PURCHASE --apply"),
 ]
 
 
@@ -2758,6 +2765,274 @@ def cmd_sync(args):
     print(f"\nSynced. Run `gads plan {args.state_file}` to verify drift is gone.")
 
 
+# ─── Sales toolkit: negatives, search terms, recommendations, asset perf ─
+#
+# Commands that directly drive revenue. Negatives block waste; search
+# terms reveal real intent; recommendations auto-applies Google's free
+# advice; asset perf surfaces what to drop.
+
+def cmd_list_negative_keywords(args):
+    """List negative keywords at campaign or ad-group scope."""
+    where = ["campaign.status != 'REMOVED'"]
+    if args.campaign:
+        where.append(f"campaign.id = {args.campaign}")
+    q = f"""
+    SELECT campaign.id, campaign.name,
+           campaign_criterion.criterion_id,
+           campaign_criterion.keyword.text,
+           campaign_criterion.keyword.match_type
+    FROM campaign_criterion
+    WHERE campaign_criterion.type = 'KEYWORD'
+      AND campaign_criterion.negative = TRUE
+      AND {' AND '.join(where)}
+    ORDER BY campaign.id
+    """
+    res = api_call("POST", "googleAds:search", {"query": q}, args.customer)
+    rows = res.get("results", [])
+
+    out = []
+    for row in rows:
+        cc = row["campaignCriterion"]
+        out.append({
+            "campaign_id": row["campaign"]["id"],
+            "campaign_name": row["campaign"]["name"],
+            "criterion_id": cc.get("criterionId"),
+            "text": cc.get("keyword", {}).get("text", ""),
+            "match_type": cc.get("keyword", {}).get("matchType", ""),
+        })
+    if args.format == "json":
+        _emit_json(out)
+        return
+    if not out:
+        print("No campaign-level negative keywords.")
+        return
+    print(f"{'CRIT ID':>14}  {'MATCH':<8}  {'CAMPAIGN':<28}  KEYWORD")
+    print("-" * 120)
+    for n in out:
+        print(f"{n['criterion_id']:>14}  {n['match_type']:<8}  {n['campaign_name'][:28]:<28}  {n['text']}")
+
+
+def cmd_add_negative_keyword(args):
+    """Add a negative keyword at campaign scope."""
+    if args.match_type not in ("EXACT", "PHRASE", "BROAD"):
+        sys.exit("ERROR: --match-type must be EXACT / PHRASE / BROAD")
+    body = {"operations": [{"create": {
+        "campaign": f"customers/{args.customer}/campaigns/{args.campaign}",
+        "negative": True,
+        "status": "ENABLED",
+        "keyword": {"text": args.text, "matchType": args.match_type},
+    }}]}
+    if not args.apply:
+        dry_run_banner(f"ADD NEGATIVE KEYWORD [{args.match_type}] '{args.text}'",
+                       f"campaign {args.campaign}")
+        return
+    res = api_call("POST", "campaignCriteria:mutate", body, args.customer)
+    rn = res["results"][0]["resourceName"]
+    print(f"OK — negative keyword [{args.match_type}] '{args.text}' added: {rn}")
+
+
+def cmd_remove_negative_keyword(args):
+    """Remove a campaign-level negative keyword by criterion_id."""
+    resource = f"customers/{args.customer}/campaignCriteria/{args.campaign}~{args.criterion_id}"
+    body = {"operations": [{"remove": resource}]}
+    if not args.apply:
+        dry_run_banner(f"REMOVE NEGATIVE KEYWORD criterion {args.criterion_id}", args.campaign)
+        return
+    api_call("POST", "campaignCriteria:mutate", body, args.customer)
+    print(f"OK — removed: {resource}")
+
+
+def cmd_list_search_terms(args):
+    """What real users actually typed before clicking your ads.
+    Sources negative-keyword candidates + new keyword opportunities."""
+    end_d = datetime.date.today() - datetime.timedelta(days=1)
+    start_d = end_d - datetime.timedelta(days=args.days - 1)
+    where = [f"segments.date BETWEEN '{start_d}' AND '{end_d}'"]
+    if args.campaign:
+        where.append(f"campaign.id = {args.campaign}")
+    q = f"""
+    SELECT search_term_view.search_term,
+           segments.search_term_match_type,
+           campaign.name,
+           metrics.impressions, metrics.clicks, metrics.cost_micros,
+           metrics.conversions, metrics.conversions_value
+    FROM search_term_view
+    WHERE {' AND '.join(where)}
+    ORDER BY metrics.cost_micros DESC
+    LIMIT {args.limit}
+    """
+    res = api_call("POST", "googleAds:search", {"query": q}, args.customer)
+    rows = res.get("results", [])
+
+    parsed = []
+    for row in rows:
+        stv = row.get("searchTermView", {})
+        m = row.get("metrics", {})
+        cost = int(m.get("costMicros", 0))
+        conv = float(m.get("conversions", 0))
+        parsed.append({
+            "search_term": stv.get("searchTerm", ""),
+            "campaign": row.get("campaign", {}).get("name", ""),
+            "match_type": row.get("segments", {}).get("searchTermMatchType", ""),
+            "impressions": int(m.get("impressions", 0)),
+            "clicks": int(m.get("clicks", 0)),
+            "cost_units": cost / 1_000_000,
+            "conversions": conv,
+            "conv_value_units": float(m.get("conversionsValue", 0)),
+            "cost_per_conv": (cost / 1_000_000 / conv) if conv else None,
+        })
+
+    if args.format == "json":
+        _emit_json(parsed)
+        return
+    if not parsed:
+        print(f"No search terms for the period {start_d} → {end_d}.")
+        return
+    print(f"Search terms — {start_d} → {end_d}  (top {len(parsed)} by spend)\n")
+    print(f"{'COST':>8}  {'CLK':>5}  {'CONV':>5}  {'MATCH':<10}  SEARCH TERM")
+    print("-" * 110)
+    for s in parsed:
+        print(f"{s['cost_units']:>8,.0f}  {s['clicks']:>5}  {s['conversions']:>5.1f}  "
+              f"{s['match_type']:<10}  {s['search_term']}")
+    # Quick analysis hint
+    zero_conv = [s for s in parsed if s["clicks"] >= 2 and s["conversions"] == 0]
+    if zero_conv:
+        print(f"\n💡  {len(zero_conv)} search term(s) with ≥2 clicks and 0 conversions —")
+        print(f"    candidates for `gads add-negative-keyword`.")
+
+
+def cmd_apply_recommendation(args):
+    """Apply one of Google's auto-generated recommendations."""
+    # Validate the recommendation exists
+    q = f"""
+    SELECT recommendation.type, recommendation.dismissed
+    FROM recommendation
+    WHERE recommendation.resource_name = '{args.resource_name}'
+    """
+    res = api_call("POST", "googleAds:search", {"query": q}, args.customer)
+    rows = res.get("results", [])
+    if not rows:
+        sys.exit(f"ERROR: recommendation not found: {args.resource_name}")
+    rec_type = rows[0]["recommendation"].get("type", "?")
+    print(f"Recommendation type: {rec_type}")
+
+    if not args.apply:
+        dry_run_banner(f"APPLY recommendation {rec_type}", args.resource_name)
+        return
+    body = {"operations": [{"resourceName": args.resource_name}]}
+    api_call("POST", "recommendations:apply", body, args.customer)
+    print(f"OK — applied recommendation: {args.resource_name}")
+
+
+def cmd_asset_performance(args):
+    """Top + bottom performing assets by impressions/clicks/conv per asset group.
+    Surfaces which headlines/descriptions to keep vs drop."""
+    where = ["asset_group_asset.status != 'REMOVED'"]
+    if args.asset_group:
+        where.append(f"asset_group.id = {args.asset_group}")
+    q = f"""
+    SELECT asset.id, asset.text_asset.text,
+           asset_group.id, asset_group.name,
+           asset_group_asset.field_type,
+           asset_group_asset.performance_label
+    FROM asset_group_asset
+    WHERE {' AND '.join(where)}
+      AND asset.type = 'TEXT'
+      AND asset_group_asset.field_type IN ('HEADLINE', 'DESCRIPTION', 'LONG_HEADLINE')
+    """
+    try:
+        res = api_call("POST", "googleAds:search", {"query": q}, args.customer)
+    except SystemExit:
+        # performance_label sometimes not yet populated for young campaigns.
+        # Retry without it.
+        q = q.replace("asset_group_asset.performance_label,", "")
+        res = api_call("POST", "googleAds:search", {"query": q}, args.customer)
+
+    rows = res.get("results", [])
+    out = []
+    for row in rows:
+        out.append({
+            "asset_id": row["asset"]["id"],
+            "text": row["asset"].get("textAsset", {}).get("text", ""),
+            "asset_group_id": row["assetGroup"]["id"],
+            "asset_group_name": row["assetGroup"]["name"],
+            "field_type": row["assetGroupAsset"]["fieldType"],
+            "performance_label": row["assetGroupAsset"].get("performanceLabel", "PENDING"),
+        })
+
+    if args.format == "json":
+        _emit_json(out)
+        return
+    if not out:
+        print("No text assets found.")
+        return
+
+    # Group by performance bucket
+    buckets = {"BEST": [], "GOOD": [], "LOW": [], "PENDING": [], "LEARNING": []}
+    for a in out:
+        buckets.setdefault(a["performance_label"], []).append(a)
+
+    for label, color_glyph in (("BEST", "🟢"), ("GOOD", "🟦"),
+                                 ("LEARNING", "⏳"), ("PENDING", "⏳"),
+                                 ("LOW", "🔴")):
+        items = buckets.get(label, [])
+        if not items:
+            continue
+        print(f"\n{color_glyph} {label}  ({len(items)})")
+        for a in items[:15]:
+            print(f"    [{a['asset_id']}]  {a['field_type']:<13}  {a['text'][:60]}")
+        if len(items) > 15:
+            print(f"    ... and {len(items) - 15} more")
+
+    low = buckets.get("LOW", [])
+    if low:
+        print(f"\n💡  {len(low)} asset(s) labelled LOW —")
+        print(f"    consider removing them to lift Ad Strength.")
+
+
+def cmd_create_conversion_action(args):
+    """Create a new conversion action. Defaults sensible for e-commerce."""
+    if args.type not in ("WEBPAGE", "WEBSITE_CALL", "UPLOAD_CLICKS", "PHONE_CALL_FROM_ADS"):
+        sys.exit("ERROR: --type must be WEBPAGE, WEBSITE_CALL, UPLOAD_CLICKS, or PHONE_CALL_FROM_ADS")
+    if args.category not in ("PURCHASE", "SIGNUP", "LEAD", "PAGE_VIEW",
+                              "ADD_TO_CART", "BEGIN_CHECKOUT", "SUBSCRIBE_PAID",
+                              "BOOK_APPOINTMENT", "DOWNLOAD"):
+        sys.exit("ERROR: --category must be one of the supported enums")
+
+    body = {"operations": [{"create": {
+        "name": args.name,
+        "type": args.type,
+        "category": args.category,
+        "status": "ENABLED",
+        "primaryForGoal": args.primary,
+        "valueSettings": {
+            "defaultValue": args.default_value,
+            "defaultCurrencyCode": args.currency,
+            "alwaysUseDefaultValue": False,
+        },
+        "countingType": "MANY_PER_CLICK" if args.category in ("ADD_TO_CART", "PAGE_VIEW") else "ONE_PER_CLICK",
+        "clickThroughLookbackWindowDays": 30,
+        "viewThroughLookbackWindowDays": 1,
+    }}]}
+
+    print(f"Will create conversion action:")
+    print(f"  Name:           {args.name}")
+    print(f"  Type:           {args.type}")
+    print(f"  Category:       {args.category}")
+    print(f"  Primary:        {args.primary}")
+    print(f"  Default value:  {args.default_value} {args.currency}")
+
+    if not args.apply:
+        dry_run_banner("CREATE conversion_action", args.name)
+        return
+    res = api_call("POST", "conversionActions:mutate", body, args.customer)
+    rn = res["results"][0]["resourceName"]
+    cid = rn.rsplit("/", 1)[-1]
+    print(f"\n✓ Conversion action created: {rn}")
+    print(f"  Conversion action ID: {cid}")
+    print(f"  Next: install the tag — gads UI → Tools → Conversions → click '{args.name}'")
+
+
 # ─── Audit log: one JSON line per --apply mutation ────────────────────────
 
 def _audit_log_path():
@@ -2941,6 +3216,8 @@ _MUTATING_COMMANDS = {
     "add-text-assets", "add-business-name", "upload-image", "add-youtube-video",
     "replace-headlines", "create-brand-campaign", "split-asset-group",
     "cleanup-orphans", "sync",
+    "add-negative-keyword", "remove-negative-keyword",
+    "apply-recommendation", "create-conversion-action",
 }
 
 
@@ -3336,6 +3613,62 @@ def main():
     sub.add_parser("health",
                    help="Single-command account dashboard"
                    ).set_defaults(func=cmd_health)
+
+    # ───── Sales toolkit ─────
+    p = sub.add_parser("list-negative-keywords",
+                       help="List campaign-level negative keywords")
+    p.add_argument("--campaign", help="Filter by campaign ID")
+    p.set_defaults(func=cmd_list_negative_keywords)
+
+    p = sub.add_parser("add-negative-keyword",
+                       help="Add a campaign-level negative keyword")
+    p.add_argument("campaign", help="Campaign ID")
+    p.add_argument("text", help="Keyword text (the word/phrase to block)")
+    p.add_argument("--match-type", required=True, dest="match_type",
+                   choices=["EXACT", "PHRASE", "BROAD"])
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_add_negative_keyword)
+
+    p = sub.add_parser("remove-negative-keyword", help="Remove a negative keyword by criterion ID")
+    p.add_argument("campaign", help="Campaign ID")
+    p.add_argument("criterion_id", help="Criterion ID (from list-negative-keywords)")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_remove_negative_keyword)
+
+    p = sub.add_parser("list-search-terms",
+                       help="What users actually searched before clicking — for harvesting keywords + negatives")
+    p.add_argument("--campaign", help="Filter by campaign ID")
+    p.add_argument("--days", type=int, default=30, help="Look back N days (default 30)")
+    p.add_argument("--limit", type=int, default=100, help="Top N by spend (default 100)")
+    p.set_defaults(func=cmd_list_search_terms)
+
+    p = sub.add_parser("apply-recommendation",
+                       help="Apply one of Google's auto-generated recommendations")
+    p.add_argument("resource_name",
+                   help="Full resource name from `gads list-recommendations`")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_apply_recommendation)
+
+    p = sub.add_parser("asset-performance",
+                       help="Top vs bottom assets by Google's performance label")
+    p.add_argument("--asset-group", dest="asset_group", help="Filter by asset group ID")
+    p.set_defaults(func=cmd_asset_performance)
+
+    p = sub.add_parser("create-conversion-action",
+                       help="Create a new conversion action")
+    p.add_argument("--name", required=True, help="Display name, e.g. 'Purchase'")
+    p.add_argument("--type", default="WEBPAGE",
+                   help="WEBPAGE (default), WEBSITE_CALL, UPLOAD_CLICKS, PHONE_CALL_FROM_ADS")
+    p.add_argument("--category", default="PURCHASE",
+                   help="PURCHASE (default), SIGNUP, LEAD, PAGE_VIEW, ADD_TO_CART, BEGIN_CHECKOUT, ...")
+    p.add_argument("--primary", action="store_true", default=True,
+                   help="Mark as primary-for-goal (default true)")
+    p.add_argument("--default-value", dest="default_value", type=float, default=0.0,
+                   help="Fallback conversion value if event doesn't send one")
+    p.add_argument("--currency", default="USD",
+                   help="3-letter ISO code, e.g. USD, HUF, EUR")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_create_conversion_action)
 
     p = sub.add_parser("audit-log", help="Show recent --apply mutations")
     p.add_argument("--tail", type=int, default=20, help="Last N entries (default: 20, 0 = all)")
