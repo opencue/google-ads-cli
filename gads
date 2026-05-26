@@ -323,6 +323,8 @@ _COMMANDS_MANIFEST = [
     ("snapshot list",            "read",   False, "List all snapshots",                     "gads snapshot list"),
     ("snapshot diff",            "read",   False, "Diff a snapshot against live",           "gads snapshot diff latest"),
     ("snapshot restore",         "mutate", True,  "Restore a snapshot to live (uses sync)", "gads snapshot restore latest --apply"),
+    ("health",                   "read",   False, "Single-command account dashboard",        "gads health"),
+    ("audit-log",                "read",   False, "Recent --apply mutations from ~/.gads/audit.log", "gads audit-log --tail 20"),
 ]
 
 
@@ -2305,6 +2307,176 @@ def cmd_sync(args):
     print(f"\nSynced. Run `gads plan {args.state_file}` to verify drift is gone.")
 
 
+# ─── Audit log: one JSON line per --apply mutation ────────────────────────
+
+def _audit_log_path():
+    return Path.home() / ".gads" / "audit.log"
+
+
+def _audit_record(args, status="attempted"):
+    """Append one JSON line to ~/.gads/audit.log. Logs regardless of
+    success/failure — pair with snapshots to reconstruct what happened."""
+    path = _audit_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "customer_id": getattr(args, "customer", None),
+        "command": args.cmd,
+        "status": status,
+        "args": {
+            k: v for k, v in vars(args).items()
+            if not k.startswith("_")
+            and k not in ("func", "customer", "cmd", "format", "profile")
+            and v not in (None, False)
+        },
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, default=str, ensure_ascii=False) + "\n")
+
+
+def cmd_audit_log(args):
+    path = _audit_log_path()
+    if not path.exists():
+        if args.format == "json":
+            _emit_json([])
+        else:
+            print(f"No audit log yet at {path}.")
+        return
+    lines = path.read_text(encoding="utf-8").splitlines()
+    tail = args.tail
+    selected = lines[-tail:] if tail > 0 else lines
+    parsed = []
+    for line in selected:
+        try:
+            parsed.append(json.loads(line))
+        except Exception:
+            continue
+
+    if args.format == "json":
+        _emit_json(parsed)
+        return
+
+    if not parsed:
+        print("(empty)")
+        return
+    print(f"{'WHEN':<20}  {'COMMAND':<22}  {'STATUS':<10}  ARGS")
+    print("-" * 110)
+    for r in parsed:
+        args_str = " ".join(
+            f"{k}={v}" for k, v in r.get("args", {}).items()
+            if k != "apply"
+        ) or "—"
+        print(f"{r['ts']:<20}  {r['command']:<22}  {r.get('status','?'):<10}  {args_str[:70]}")
+
+
+# ─── Health: single-command account dashboard ─────────────────────────────
+
+def cmd_health(args):
+    customer = args.customer
+
+    # Account
+    res = api_call("POST", "googleAds:search", {"query":
+        "SELECT customer.id, customer.descriptive_name, customer.currency_code, "
+        "customer.time_zone, customer.optimization_score FROM customer"}, customer)
+    cust = res["results"][0]["customer"] if res.get("results") else {}
+
+    # Campaigns + 7d perf
+    end_d = datetime.date.today() - datetime.timedelta(days=1)
+    start_d = end_d - datetime.timedelta(days=6)
+    res = api_call("POST", "googleAds:search", {"query": f"""
+        SELECT campaign.id, campaign.status,
+               campaign.advertising_channel_type,
+               metrics.cost_micros, metrics.clicks, metrics.conversions
+        FROM campaign WHERE segments.date BETWEEN '{start_d}' AND '{end_d}'
+          AND campaign.status != 'REMOVED'
+    """}, customer)
+    campaign_rows = res.get("results", [])
+    by_status = {}
+    total_cost, total_clicks, total_conv = 0, 0, 0.0
+    for row in campaign_rows:
+        c = row["campaign"]
+        by_status[c["status"]] = by_status.get(c["status"], 0) + 1
+        m = row.get("metrics", {})
+        total_cost += int(m.get("costMicros", 0))
+        total_clicks += int(m.get("clicks", 0))
+        total_conv += float(m.get("conversions", 0))
+
+    # Account-level assets
+    res = api_call("POST", "googleAds:search", {"query":
+        "SELECT customer_asset.field_type FROM customer_asset "
+        "WHERE customer_asset.status != 'REMOVED'"}, customer)
+    asset_counts = {}
+    for row in res.get("results", []):
+        ft = row["customerAsset"]["fieldType"]
+        asset_counts[ft] = asset_counts.get(ft, 0) + 1
+
+    # Asset groups
+    res = api_call("POST", "googleAds:search", {"query":
+        "SELECT asset_group.ad_strength FROM asset_group "
+        "WHERE asset_group.status != 'REMOVED'"}, customer)
+    ag_strength = {}
+    for row in res.get("results", []):
+        s = row["assetGroup"].get("adStrength", "UNKNOWN")
+        ag_strength[s] = ag_strength.get(s, 0) + 1
+
+    # Snapshot + audit pointers
+    snaps = _snapshot_list()
+    latest_snap = snaps[0].stem if snaps else None
+    audit_path = _audit_log_path()
+    last_audit = None
+    if audit_path.exists():
+        lines = audit_path.read_text(encoding="utf-8").splitlines()
+        if lines:
+            try:
+                last_audit = json.loads(lines[-1])
+            except Exception:
+                pass
+
+    payload = {
+        "customer_id": cust.get("id"),
+        "descriptive_name": cust.get("descriptiveName"),
+        "currency": cust.get("currencyCode"),
+        "time_zone": cust.get("timeZone"),
+        "optimization_score": float(cust.get("optimizationScore", 0)),
+        "campaigns_by_status": by_status,
+        "perf_7d": {
+            "cost_units": total_cost / 1_000_000,
+            "clicks": total_clicks,
+            "conversions": total_conv,
+        },
+        "account_assets": asset_counts,
+        "asset_groups_by_strength": ag_strength,
+        "latest_snapshot": latest_snap,
+        "last_audit_entry": last_audit,
+    }
+
+    if args.format == "json":
+        _emit_json(payload)
+        return
+
+    name = payload["descriptive_name"] or "(unnamed)"
+    print(f"╔═ {name}  ({customer}) ═══════════════════════════════════════════╗")
+    print(f"  Currency:           {payload['currency']}   ·   TZ: {payload['time_zone']}")
+    score = payload["optimization_score"] * 100
+    score_glyph = "✓" if score >= 70 else ("⚠" if score >= 40 else "✗")
+    print(f"  Optimization Score: {score_glyph} {score:.0f}%   (target: 70%+)")
+    print()
+    print(f"  Campaigns:  " + ", ".join(f"{k}={v}" for k, v in by_status.items()) or "  none")
+    p = payload["perf_7d"]
+    print(f"  Last 7 days: {p['cost_units']:,.0f} spend  ·  {p['clicks']:,} clicks  ·  {p['conversions']:.1f} conv")
+    print()
+    print(f"  Account assets: " + (", ".join(f"{k}={v}" for k, v in asset_counts.items()) or "(none)"))
+    print(f"  Asset groups:   " + (", ".join(f"{k}={v}" for k, v in ag_strength.items()) or "(none)"))
+    print()
+    if latest_snap:
+        print(f"  Latest snapshot: {latest_snap}")
+    if last_audit:
+        print(f"  Last mutation:   {last_audit.get('ts')}  {last_audit.get('command')}")
+    print(f"╚═════════════════════════════════════════════════════════════════════╝")
+    print()
+    print(f"Run `gads suggest` for prioritized fix recommendations.")
+
+
 # ─── Snapshots: save / list / diff / restore ──────────────────────────────
 #
 # A snapshot is just an export TOML written to ~/.gads/snapshots/. They
@@ -2640,6 +2812,13 @@ def main():
     sub.add_parser("suggest",
                    help="Audit the account and print prioritized fix recommendations"
                    ).set_defaults(func=cmd_suggest)
+    sub.add_parser("health",
+                   help="Single-command account dashboard"
+                   ).set_defaults(func=cmd_health)
+
+    p = sub.add_parser("audit-log", help="Show recent --apply mutations")
+    p.add_argument("--tail", type=int, default=20, help="Last N entries (default: 20, 0 = all)")
+    p.set_defaults(func=cmd_audit_log)
 
     p = sub.add_parser("export",
                        help="Export live account state to a TOML file (v1: campaigns)")
@@ -2813,7 +2992,24 @@ def main():
         except Exception as e:
             print(f"  ⚠  Auto-snapshot failed: {e}  (proceeding anyway)")
 
-    args.func(args)
+    # Run the command, audit-log regardless of outcome (sys.exit still
+    # triggers `finally`).
+    audit_status = "completed"
+    try:
+        args.func(args)
+    except SystemExit as e:
+        audit_status = f"sys_exit:{e.code}"
+        raise
+    except Exception as e:
+        audit_status = f"error:{type(e).__name__}"
+        raise
+    finally:
+        if is_mutating_apply:
+            try:
+                _audit_record(args, status=audit_status)
+            except Exception as e:
+                # Audit logging should never break a real command.
+                print(f"  ⚠  Audit log write failed: {e}")
 
 
 if __name__ == "__main__":
