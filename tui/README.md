@@ -49,13 +49,32 @@ gads-tui
 
 | Key      | What it does                                          |
 |---------:|-------------------------------------------------------|
-| `q` `Esc`| Quit (closes suggest modal first if open)             |
+| `q` `Esc`| Quit (closes any open modal first)                    |
 | `r`      | Force refresh                                         |
 | `p`      | Toggle PAUSED ↔ ENABLED on the selected campaign      |
+| `b`      | Set daily budget on the selected campaign (text input)|
 | `s`      | Open `gads suggest` modal — prioritized fix punch list|
 | `↑`/`k`  | Move selection up                                     |
 | `↓`/`j`  | Move selection down                                   |
 | `Ctrl+C` | Quit (same as `q`)                                    |
+
+### Budget modal
+
+Press `b` on the selected campaign. A centered modal shows:
+
+```
+┌─ Set daily budget · Enter to commit · Esc to cancel ─┐
+│                                                       │
+│   Campaign: Sales-Performance Max-1                   │
+│   Current:  1000 /day                                 │
+│                                                       │
+│   New:      1200_ /day                                │
+│                                                       │
+└───────────────────────────────────────────────────────┘
+```
+
+Only digit keys + backspace are accepted. Enter shells out to
+`gads set-budget <id> --daily <value> --apply`. Esc cancels.
 
 ## Safety
 
@@ -67,12 +86,11 @@ gads-tui
 
 ## Roadmap
 
-- `b` to change budget (modal text input)
-- `e` (alias for ENABLED-only) and `d` (alias for PAUSED-only)
 - Asset group drill-down (Enter on selected campaign)
 - Multi-profile view: switch profiles with `Tab`
 - Live spend deltas with sparklines
 - Alerts panel: lost-IS spikes, optimization-score drops, budget hits
+- Inline `gads cleanup-orphans` / `snapshot save` from the dashboard
 
 ## Single-binary install
 

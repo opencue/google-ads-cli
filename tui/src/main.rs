@@ -54,6 +54,15 @@ struct SuggestIssue {
     suggest: Option<String>,
 }
 
+enum InputMode {
+    Budget {
+        campaign_id: String,
+        campaign_name: String,
+        current: String,   // existing budget for display
+        buffer: String,    // user-typed digits
+    },
+}
+
 struct App {
     campaigns: Vec<Campaign>,
     table_state: TableState,
@@ -63,6 +72,7 @@ struct App {
     refreshing: bool,
     show_suggest: bool,
     suggest: Option<SuggestPayload>,
+    input_mode: Option<InputMode>,
 }
 
 impl App {
@@ -76,7 +86,50 @@ impl App {
             refreshing: false,
             show_suggest: false,
             suggest: None,
+            input_mode: None,
         }
+    }
+
+    fn start_budget_input(&mut self) {
+        if let Some(c) = self.selected_campaign() {
+            self.input_mode = Some(InputMode::Budget {
+                campaign_id: c.id.clone(),
+                campaign_name: c.name.clone(),
+                current: c.budget_units.map(|u| format!("{u:.0}")).unwrap_or("—".into()),
+                buffer: String::new(),
+            });
+        }
+    }
+
+    fn commit_budget_input(&mut self) -> Result<()> {
+        let (campaign_id, value) = if let Some(InputMode::Budget { campaign_id, buffer, .. }) = &self.input_mode {
+            if buffer.is_empty() {
+                self.status_message = "Budget empty — cancelled.".into();
+                self.input_mode = None;
+                return Ok(());
+            }
+            (campaign_id.clone(), buffer.clone())
+        } else {
+            return Ok(());
+        };
+        self.input_mode = None;
+        self.status_message = format!("Setting budget on {campaign_id} → {value}…");
+        let out = Command::new("gads")
+            .env("GADS_NO_AUTOSNAPSHOT", "1")
+            .args(["set-budget", &campaign_id, "--daily", &value, "--apply"])
+            .output()
+            .context("failed to spawn `gads set-budget`")?;
+        if out.status.success() {
+            self.status_message = format!("✓ budget [{campaign_id}] → {value}/day");
+            self.refresh()?;
+        } else {
+            let err = String::from_utf8_lossy(&out.stderr);
+            self.status_message = format!(
+                "✗ set-budget failed: {}",
+                err.lines().next().unwrap_or("(no stderr)")
+            );
+        }
+        Ok(())
     }
 
     fn selected_campaign(&self) -> Option<&Campaign> {
@@ -212,7 +265,33 @@ fn run(terminal: &mut Term, app: &mut App) -> Result<()> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                // Esc closes the modal first if it's open; otherwise it quits.
+
+                // Budget input mode captures keys exclusively.
+                if app.input_mode.is_some() {
+                    match key.code {
+                        KeyCode::Esc => {
+                            app.input_mode = None;
+                            app.status_message = "Budget input cancelled.".into();
+                        }
+                        KeyCode::Enter => app.commit_budget_input()?,
+                        KeyCode::Backspace => {
+                            if let Some(InputMode::Budget { buffer, .. }) = &mut app.input_mode {
+                                buffer.pop();
+                            }
+                        }
+                        KeyCode::Char(c) if c.is_ascii_digit() => {
+                            if let Some(InputMode::Budget { buffer, .. }) = &mut app.input_mode {
+                                if buffer.len() < 10 {
+                                    buffer.push(c);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Esc closes the suggest modal first if it's open.
                 if app.show_suggest
                     && matches!(key.code, KeyCode::Esc | KeyCode::Char('s') | KeyCode::Char('q'))
                 {
@@ -225,6 +304,7 @@ fn run(terminal: &mut Term, app: &mut App) -> Result<()> {
                     | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(()),
                     (KeyCode::Char('r'), _) => app.refresh()?,
                     (KeyCode::Char('p'), _) => app.toggle_selected_status()?,
+                    (KeyCode::Char('b'), _) => app.start_budget_input(),
                     (KeyCode::Char('s'), _) => app.load_suggest()?,
                     (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.move_selection(1),
                     (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.move_selection(-1),
@@ -256,6 +336,56 @@ fn ui(f: &mut Frame, app: &App) {
     if app.show_suggest {
         render_suggest_modal(f, app);
     }
+    if app.input_mode.is_some() {
+        render_input_modal(f, app);
+    }
+}
+
+
+fn render_input_modal(f: &mut Frame, app: &App) {
+    let im = match &app.input_mode {
+        Some(im) => im,
+        None => return,
+    };
+    // Centered narrow modal, ~50% wide, 7 rows tall.
+    let area = centered_rect(50, 25, f.area());
+    f.render_widget(Clear, area);
+
+    let (title, lines) = match im {
+        InputMode::Budget { campaign_name, current, buffer, .. } => {
+            let title = " Set daily budget · Enter to commit · Esc to cancel ";
+            let body = vec![
+                Line::from(vec![
+                    Span::raw("Campaign: "),
+                    Span::styled(campaign_name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(vec![
+                    Span::raw("Current:  "),
+                    Span::styled(current.clone(), Style::default().fg(Color::DarkGray)),
+                    Span::raw(" /day"),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("New:      "),
+                    Span::styled(
+                        if buffer.is_empty() { "_".to_string() } else { format!("{buffer}_") },
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" /day"),
+                ]),
+            ];
+            (title, body)
+        }
+    };
+
+    let p = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .padding(Padding::uniform(1)),
+    );
+    f.render_widget(p, area);
 }
 
 
@@ -480,6 +610,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" refresh  "),
         Span::styled(" p ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::raw(" pause/enable  "),
+        Span::styled(" b ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Span::raw(" budget  "),
         Span::styled(" s ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::raw(" suggest  "),
         Span::styled(" ↑↓ ", Style::default().bg(Color::DarkGray).fg(Color::White)),
