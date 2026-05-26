@@ -315,6 +315,7 @@ _COMMANDS_MANIFEST = [
     ("set-budget",               "mutate", True,  "Change daily budget",            "gads set-budget <campaign_id> --daily 5000 --apply"),
     ("set-status",               "mutate", True,  "Enable / pause a resource",      "gads set-status campaign <id> ENABLED --apply"),
     ("cleanup-orphans",          "mutate", True,  "Delete orphan budgets/assets",   "gads cleanup-orphans --type all --apply"),
+    ("suggest",                  "read",   False, "Audit + prioritized fix recommendations", "gads suggest"),
 ]
 
 
@@ -1861,6 +1862,261 @@ def cmd_set_budget(args):
     print(f"OK — daily budget {args.daily} on {budget_resource}")
 
 
+# ─── Suggest: rules-engine over account state ─────────────────────────────
+#
+# Each rule is a function taking `state` (a dict of account snapshots
+# pre-fetched once) and returning None or an Issue dict.  Add new rules
+# by appending to `_SUGGEST_RULES` — they auto-run and sort by severity.
+
+def _gather_account_state(customer_id):
+    """One-shot snapshot used by all suggest rules. Single GAQL fan-out."""
+    state = {"customer_id": customer_id}
+
+    # Account: optimization score, currency, time zone
+    res = api_call("POST", "googleAds:search", {"query":
+        "SELECT customer.optimization_score, customer.currency_code, "
+        "customer.time_zone FROM customer"}, customer_id)
+    rows = res.get("results", [])
+    if rows:
+        c = rows[0]["customer"]
+        state["optimization_score"] = float(c.get("optimizationScore", 0))
+        state["currency"] = c.get("currencyCode")
+        state["time_zone"] = c.get("timeZone")
+
+    # Campaigns + last-30d perf
+    today = datetime.date.today()
+    end_d = today - datetime.timedelta(days=1)
+    start_d = end_d - datetime.timedelta(days=29)
+    res = api_call("POST", "googleAds:search", {"query": f"""
+        SELECT
+          campaign.id, campaign.name, campaign.status,
+          campaign.advertising_channel_type,
+          campaign_budget.amount_micros,
+          metrics.cost_micros, metrics.impressions, metrics.clicks,
+          metrics.conversions, metrics.conversions_value,
+          metrics.search_impression_share,
+          metrics.search_budget_lost_impression_share,
+          metrics.search_rank_lost_impression_share
+        FROM campaign
+        WHERE segments.date BETWEEN '{start_d}' AND '{end_d}'
+          AND campaign.status != 'REMOVED'
+    """}, customer_id)
+    state["campaigns"] = res.get("results", [])
+
+    # Asset groups + ad strength
+    res = api_call("POST", "googleAds:search", {"query":
+        "SELECT asset_group.id, asset_group.name, asset_group.status, "
+        "asset_group.ad_strength, asset_group.final_urls, campaign.id "
+        "FROM asset_group WHERE asset_group.status != 'REMOVED'"}, customer_id)
+    state["asset_groups"] = res.get("results", [])
+
+    # Conversion actions
+    res = api_call("POST", "googleAds:search", {"query":
+        "SELECT conversion_action.id, conversion_action.name, "
+        "conversion_action.status, conversion_action.primary_for_goal "
+        "FROM conversion_action WHERE conversion_action.status != 'REMOVED'"
+    }, customer_id)
+    state["conversion_actions"] = res.get("results", [])
+
+    return state
+
+
+# Each rule returns None (no issue) or a dict with keys:
+#   rule, severity (P0/P1/P2), title, detail, suggest (cmd or None), context (dict)
+def _rule_optimization_score_zero(state):
+    if state.get("optimization_score", 1.0) <= 0.01:
+        return {
+            "rule": "optimization_score_zero",
+            "severity": "P0",
+            "title": "Optimization Score is 0%",
+            "detail": "Google's own health score is 0% — the account is below the floor of every recommendation. Usually a tracking gap + missing extensions + thin assets. Address P0/P1 items below to lift it.",
+            "suggest": None,
+            "context": {"optimization_score": state["optimization_score"]},
+        }
+    return None
+
+
+def _rule_no_conversions_30d(state):
+    if not state.get("conversion_actions"):
+        return None
+    total_clicks = sum(int(row.get("metrics", {}).get("clicks", 0))
+                       for row in state.get("campaigns", []))
+    total_conv = sum(float(row.get("metrics", {}).get("conversions", 0))
+                     for row in state.get("campaigns", []))
+    if total_clicks >= 5 and total_conv == 0:
+        return {
+            "rule": "no_conversions_30d",
+            "severity": "P0",
+            "title": "No conversions registered in 30 days",
+            "detail": f"{total_clicks} clicks in 30d, 0 conversions. Either tracking is broken (env var missing, GTM tag not firing) or genuinely no purchases yet. Run a test purchase + watch the 'Last received conversion' timestamp in the Ads UI.",
+            "suggest": "gads auth-check  # confirm reachability + then test purchase manually",
+            "context": {"clicks_30d": total_clicks, "conversions_30d": total_conv},
+        }
+    return None
+
+
+def _rule_ad_strength_poor(state):
+    poor = [
+        ag for ag in state.get("asset_groups", [])
+        if ag["assetGroup"].get("adStrength") == "POOR"
+        and ag["assetGroup"].get("status") == "ENABLED"
+    ]
+    if not poor:
+        return None
+    names = ", ".join(ag["assetGroup"]["name"] for ag in poor)
+    ag_id = poor[0]["assetGroup"]["id"]
+    return {
+        "rule": "ad_strength_poor",
+        "severity": "P1",
+        "title": f"{len(poor)} asset group(s) rated POOR",
+        "detail": f"Asset group(s): {names}. POOR rating restricts where ads can serve. Most common gap: missing YOUTUBE_VIDEO (PMAX requires 1). Also check sitelinks/callouts/snippets at account level.",
+        "suggest": f"gads list-assets {ag_id}    # see what's there\ngads add-youtube-video {ag_id} <video_id> --apply",
+        "context": {"poor_asset_group_ids": [ag["assetGroup"]["id"] for ag in poor]},
+    }
+
+
+def _rule_lost_is_rank_high(state):
+    worst = 0.0
+    worst_campaign = None
+    for row in state.get("campaigns", []):
+        lr = float(row.get("metrics", {}).get("searchRankLostImpressionShare", 0))
+        if lr > worst:
+            worst, worst_campaign = lr, row["campaign"]["name"]
+    if worst > 0.5:
+        return {
+            "rule": "lost_is_rank_high",
+            "severity": "P1",
+            "title": f"Lost IS to rank {worst*100:.1f}% (campaign: {worst_campaign})",
+            "detail": "Losing >50% of impressions because Google rates your ads weaker than competitors'. Drivers: weak Ad Strength, generic headlines, missing extensions, low Quality Score. Add the missing extensions + replace generic headlines with USP-driven ones.",
+            "suggest": "gads seed-account-assets --pack account-assets --apply\ngads replace-headlines <ag_id> --pack <brand> --apply",
+            "context": {"lost_is_rank": worst, "worst_campaign": worst_campaign},
+        }
+    return None
+
+
+def _rule_lost_is_budget_high(state):
+    worst = 0.0
+    worst_campaign = None
+    for row in state.get("campaigns", []):
+        lb = float(row.get("metrics", {}).get("searchBudgetLostImpressionShare", 0))
+        if lb > worst:
+            worst, worst_campaign = lb, row["campaign"]["name"]
+    if worst > 0.3:
+        return {
+            "rule": "lost_is_budget_high",
+            "severity": "P2",
+            "title": f"Lost IS to budget {worst*100:.1f}% (campaign: {worst_campaign})",
+            "detail": "Daily budget runs out mid-day. If conversions are landing, you have headroom to ramp budget without losing ROAS. Increase by 30-50% per week, not in one jump (PMAX re-learns).",
+            "suggest": "gads set-budget <campaign_id> --daily <new_amount> --apply",
+            "context": {"lost_is_budget": worst, "worst_campaign": worst_campaign},
+        }
+    return None
+
+
+def _rule_no_brand_search(state):
+    has_brand_search = any(
+        "brand" in row["campaign"]["name"].lower()
+        and row["campaign"].get("advertisingChannelType") == "SEARCH"
+        for row in state.get("campaigns", [])
+    )
+    if has_brand_search:
+        return None
+    return {
+        "rule": "no_brand_search",
+        "severity": "P1",
+        "title": "No Brand Search campaign detected",
+        "detail": "Brand search clicks are the cheapest, highest-intent traffic. Without a brand campaign, competitors can bid on your name and you pay more via PMAX for what should be defensive brand traffic.",
+        "suggest": "gads create-brand-campaign --pack brand-search --apply",
+        "context": {},
+    }
+
+
+def _rule_no_account_assets(state):
+    res = api_call("POST", "googleAds:search", {"query":
+        "SELECT customer_asset.field_type FROM customer_asset "
+        "WHERE customer_asset.status != 'REMOVED'"}, state["customer_id"])
+    field_types = set(row["customerAsset"]["fieldType"]
+                      for row in res.get("results", []))
+    missing = [ft for ft in ("SITELINK", "CALLOUT", "STRUCTURED_SNIPPET")
+               if ft not in field_types]
+    if not missing:
+        return None
+    return {
+        "rule": "no_account_assets",
+        "severity": "P1",
+        "title": f"Missing account-level: {', '.join(missing)}",
+        "detail": "Account-level sitelinks/callouts/snippets attach to every campaign automatically and raise Ad Strength + visibility. Without them you lose ~20% of impression real estate.",
+        "suggest": "gads seed-account-assets --pack account-assets --apply",
+        "context": {"missing_field_types": missing},
+    }
+
+
+_SUGGEST_RULES = [
+    _rule_optimization_score_zero,
+    _rule_no_conversions_30d,
+    _rule_ad_strength_poor,
+    _rule_lost_is_rank_high,
+    _rule_lost_is_budget_high,
+    _rule_no_brand_search,
+    _rule_no_account_assets,
+]
+
+_SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2}
+_SEVERITY_GLYPH = {"P0": "✗", "P1": "⚠", "P2": "✓"}
+
+
+def cmd_suggest(args):
+    if args.format != "json":
+        print(f"Auditing customer {args.customer}...\n")
+    state = _gather_account_state(args.customer)
+
+    issues = []
+    for rule in _SUGGEST_RULES:
+        try:
+            result = rule(state)
+            if result:
+                issues.append(result)
+        except Exception as e:
+            issues.append({
+                "rule": rule.__name__, "severity": "P2",
+                "title": "Rule errored",
+                "detail": f"{rule.__name__} raised: {e}",
+                "suggest": None, "context": {},
+            })
+    issues.sort(key=lambda i: (_SEVERITY_RANK.get(i["severity"], 9), i["rule"]))
+
+    if args.format == "json":
+        _emit_json({
+            "customer_id": args.customer,
+            "optimization_score": state.get("optimization_score"),
+            "issues": issues,
+        })
+        return
+
+    if not issues:
+        print("✓ No issues flagged. Re-run periodically.")
+        return
+
+    for issue in issues:
+        glyph = _SEVERITY_GLYPH.get(issue["severity"], "•")
+        print(f"{glyph} {issue['severity']}  {issue['title']}")
+        # Wrap detail to ~76 cols at word boundaries.
+        import textwrap
+        for line in textwrap.wrap(issue["detail"], width=76,
+                                   initial_indent="      ", subsequent_indent="      "):
+            print(line)
+        if issue.get("suggest"):
+            print(f"      Try:")
+            for cmd in issue["suggest"].splitlines():
+                print(f"        {cmd.strip()}")
+        print()
+
+    p0 = sum(1 for i in issues if i["severity"] == "P0")
+    p1 = sum(1 for i in issues if i["severity"] == "P1")
+    p2 = sum(1 for i in issues if i["severity"] == "P2")
+    print(f"Summary: {p0} P0  |  {p1} P1  |  {p2} P2")
+
+
 # ─── Orphan cleanup ───────────────────────────────────────────────────────
 
 def _orphan_budgets(customer_id):
@@ -2063,6 +2319,10 @@ def main():
     p.add_argument("status", choices=["ENABLED", "PAUSED"])
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_set_status)
+
+    sub.add_parser("suggest",
+                   help="Audit the account and print prioritized fix recommendations"
+                   ).set_defaults(func=cmd_suggest)
 
     p = sub.add_parser("cleanup-orphans")
     p.add_argument("--type", default="all", choices=["budget", "asset", "all"],
