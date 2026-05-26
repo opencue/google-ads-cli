@@ -1,0 +1,90 @@
+name: Release
+
+# Triggered by tag pushes matching v*.*.* — `git tag v0.1.0 && git push --tags`.
+# Builds gads-tui for the common desktop targets and attaches the archives
+# to the corresponding GitHub Release.
+
+on:
+  push:
+    tags: ['v*.*.*']
+  # Manual dispatch lets us also test the workflow without cutting a tag.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            ext: .exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tui
+
+      - name: Build
+        working-directory: tui
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip (unix)
+        if: runner.os != 'Windows'
+        run: strip tui/target/${{ matrix.target }}/release/gads-tui || true
+
+      - name: Package · tar.gz
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          cd tui/target/${{ matrix.target }}/release
+          tar czf "$GITHUB_WORKSPACE/gads-tui-${{ matrix.target }}.tar.gz" gads-tui
+
+      - name: Package · zip
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          cd tui/target/${{ matrix.target }}/release
+          7z a "$GITHUB_WORKSPACE/gads-tui-${{ matrix.target }}.zip" "gads-tui${{ matrix.ext }}"
+
+      - name: Upload artifact (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gads-tui-${{ matrix.target }}
+          path: |
+            gads-tui-${{ matrix.target }}.tar.gz
+            gads-tui-${{ matrix.target }}.zip
+          if-no-files-found: ignore
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: false
+          files: |
+            gads-tui-${{ matrix.target }}.tar.gz
+            gads-tui-${{ matrix.target }}.zip
+          # Auto-generate release notes from the commit log between tags
+          generate_release_notes: true

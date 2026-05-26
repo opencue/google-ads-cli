@@ -168,16 +168,22 @@ Common LLM-driven workflows:
 ## Live terminal dashboard (`gads-tui`)
 
 A Rust companion binary that reads from `gads --format json list-campaigns`
-and shows a live, auto-refreshing dashboard. See [`tui/README.md`](tui/README.md).
+and shows a live, auto-refreshing dashboard with single-keystroke
+mutations (`p` pause/enable, `b` budget, `s` suggest, `Tab` switch
+profile). See [`tui/README.md`](tui/README.md).
 
 ```bash
-cd tui
-cargo build --release
-./target/release/gads-tui
+# Pre-built binary (no Rust toolchain needed):
+curl -L https://github.com/NagyVikt/google-ads-cli/releases/latest/download/gads-tui-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo install gads-tui /usr/local/bin/
+gads-tui
+
+# Or from source:
+cd tui && cargo build --release && ./target/release/gads-tui
 ```
 
-Builds to a ~650KB stripped static binary. The Python CLI stays
-zero-dep; the TUI is opt-in and only needed if you want the live view.
+~687KB stripped static binary. The Python CLI stays zero-dep; the TUI
+is opt-in.
 
 ## Roadmap
 

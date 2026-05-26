@@ -24,18 +24,45 @@ The two binaries talk via `gads --format json` — the TUI shells out to
 the Python CLI for data. So everything the TUI shows is data the CLI
 already exposes.
 
-## Build
+## Install
+
+### Pre-built binary (no Rust toolchain required)
+
+Grab the latest archive for your platform from the
+[Releases page](https://github.com/NagyVikt/google-ads-cli/releases):
+
+```bash
+# Linux x86_64
+curl -L https://github.com/NagyVikt/google-ads-cli/releases/latest/download/gads-tui-x86_64-unknown-linux-gnu.tar.gz \
+    | tar xz
+sudo install gads-tui /usr/local/bin/
+
+# macOS Apple Silicon
+curl -L https://github.com/NagyVikt/google-ads-cli/releases/latest/download/gads-tui-aarch64-apple-darwin.tar.gz \
+    | tar xz
+sudo install gads-tui /usr/local/bin/
+
+# macOS Intel
+curl -L https://github.com/NagyVikt/google-ads-cli/releases/latest/download/gads-tui-x86_64-apple-darwin.tar.gz \
+    | tar xz
+sudo install gads-tui /usr/local/bin/
+
+# Windows x86_64 — download from the Releases page and extract the .exe
+```
+
+Binaries are produced by [`.github/workflows/release.yml`](../.github/workflows/release.yml)
+on every `v*.*.*` tag push and attached to the corresponding GitHub
+Release.
+
+### From source
 
 ```bash
 # Requires Rust 1.75+. Install via https://rustup.rs/
 cd tui
 cargo build --release
 ./target/release/gads-tui
-```
 
-Or install globally:
-
-```bash
+# Or install globally:
 cargo install --path tui
 gads-tui
 ```
