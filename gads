@@ -260,6 +260,11 @@ def micros_to_units(micros):
     return f"{int(micros) / 1_000_000:.0f}"
 
 
+def _emit_json(data):
+    """Print machine-readable JSON. Used when --format=json."""
+    print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+
+
 def dry_run_banner(action, target):
     print(f"  ╭──────────────────────────────────────────────────────────╮")
     print(f"  │  DRY RUN — nothing was sent to the API                   │")
@@ -268,27 +273,123 @@ def dry_run_banner(action, target):
     print(f"  ╰──────────────────────────────────────────────────────────╯")
 
 
+# ─── Commands: self-description ───────────────────────────────────────────
+
+# Lightweight command manifest. Hand-curated so an LLM agent can discover
+# the command surface in one call. Keep in sync with the argparse below.
+_COMMANDS_MANIFEST = [
+    # name, category, mutates, description, example
+    ("list-profiles",        "read",   False, "List configured profiles",                  "gads list-profiles"),
+    ("list-campaigns",       "read",   False, "Active campaigns + budget + bid strategy",  "gads list-campaigns"),
+    ("list-conversions",     "read",   False, "Conversion actions",                        "gads list-conversions"),
+    ("list-assets",          "read",   False, "Assets in an asset group",                  "gads list-assets <asset_group_id>"),
+    ("list-account-assets",  "read",   False, "Account-level sitelinks/callouts/snippets", "gads list-account-assets"),
+    ("list-adgroups",        "read",   False, "Ad groups",                                 "gads list-adgroups --campaign <id>"),
+    ("list-keywords",        "read",   False, "Keywords with match types + quality scores","gads list-keywords --campaign <id>"),
+    ("list-recommendations", "read",   False, "Pending Google recommendations",            "gads list-recommendations"),
+    ("stats",                "read",   False, "Campaign KPIs over a date range",           "gads stats --days 30"),
+    ("stats-vs-prev",        "read",   False, "Period vs prior period delta",              "gads stats-vs-prev --days 14"),
+    ("gaql",                 "read",   False, "Run any GAQL query (debug)",                "gads gaql \"SELECT campaign.id FROM campaign LIMIT 5\""),
+    ("commands",             "meta",   False, "Self-describing command manifest",          "gads commands --json"),
+
+    ("add-sitelink",         "mutate", True,  "Create single account-level sitelink",      "gads add-sitelink \"My Link\" https://example.com/page --apply"),
+    ("add-callout",          "mutate", True,  "Create single account-level callout",       "gads add-callout \"Free shipping\" --apply"),
+    ("add-snippet",          "mutate", True,  "Create structured snippet (min 3 values)",  "gads add-snippet Brands BrandA BrandB BrandC --apply"),
+    ("seed-account-assets",  "mutate", True,  "Bulk sitelinks/callouts/snippets from TOML","gads seed-account-assets --pack account-assets --apply"),
+    ("add-text-assets",      "mutate", True,  "Bulk add text assets to an asset group",    "gads add-text-assets <ag_id> --field-type HEADLINE \"H1\" \"H2\" \"H3\" --apply"),
+    ("add-business-name",    "mutate", True,  "BUSINESS_NAME (Brand-Guidelines-aware)",    "gads add-business-name <ag_id> \"My Brand\" --apply"),
+    ("upload-image",         "mutate", True,  "Upload + link image asset",                 "gads upload-image <ag_id> ./logo.png --field-type LOGO --apply"),
+    ("add-youtube-video",    "mutate", True,  "Link a YouTube video as asset",             "gads add-youtube-video <ag_id> dQw4w9WgXcQ --apply"),
+    ("replace-headlines",    "mutate", True,  "Atomic remove + add headlines from a pack", "gads replace-headlines <ag_id> --pack brand-a --apply"),
+    ("create-brand-campaign","mutate", True,  "Full Brand Search campaign from pack",      "gads create-brand-campaign --pack brand-search --apply"),
+    ("split-asset-group",    "mutate", True,  "Spawn N new asset groups from brand packs", "gads split-asset-group <src_ag> --brand-packs a,b,c --apply"),
+
+    ("delete-conversion",        "mutate", True,  "Delete a conversion action",     "gads delete-conversion <id> --apply"),
+    ("disable-url-expansion",    "mutate", True,  "PMAX URL expansion OFF",         "gads disable-url-expansion <campaign_id> --apply"),
+    ("enable-url-expansion",     "mutate", True,  "PMAX URL expansion ON",          "gads enable-url-expansion <campaign_id> --apply"),
+    ("set-bid",                  "mutate", True,  "Change bid strategy",            "gads set-bid <campaign_id> --strategy TARGET_CPA --target 5000 --apply"),
+    ("set-budget",               "mutate", True,  "Change daily budget",            "gads set-budget <campaign_id> --daily 5000 --apply"),
+    ("set-status",               "mutate", True,  "Enable / pause a resource",      "gads set-status campaign <id> ENABLED --apply"),
+    ("cleanup-orphans",          "mutate", True,  "Delete orphan budgets/assets",   "gads cleanup-orphans --type all --apply"),
+]
+
+
+def cmd_commands(args):
+    out = {
+        "version": "1.0",
+        "global_args": [
+            {"name": "--customer",  "description": "Override profile's customer_id"},
+            {"name": "--profile",   "description": "Profile name from ~/.config/gads/profiles/"},
+            {"name": "--format",    "description": "table (default) or json"},
+        ],
+        "auth": {
+            "method": "gcloud ADC + developer token env var",
+            "required_env": ["GOOGLE_ADS_DEVELOPER_TOKEN"],
+            "optional_env": ["GOOGLE_ADS_LOGIN_CUSTOMER_ID", "GADS_PROFILE"],
+            "preflight": "gcloud auth application-default print-access-token",
+        },
+        "safety": {
+            "default_mode": "dry-run for all mutating commands",
+            "commit_flag": "--apply",
+        },
+        "commands": [
+            {
+                "name": name,
+                "category": category,
+                "mutating": mutates,
+                "description": desc,
+                "example": example,
+            }
+            for (name, category, mutates, desc, example) in _COMMANDS_MANIFEST
+        ],
+    }
+    # `commands` is always JSON regardless of --format. It's a discovery API.
+    _emit_json(out)
+
+
 # ─── Commands: profile listing ────────────────────────────────────────────
 
 def cmd_list_profiles(args):
     pdir = _GADS_CONFIG_DIR / "profiles"
     if not pdir.exists():
-        print(f"No profiles directory yet at {pdir}")
-        print(f"Create one: mkdir -p {pdir} && put <name>.toml files in it.")
+        if args.format == "json":
+            _emit_json({"profiles": [], "default_profile": None, "config_dir": str(pdir)})
+        else:
+            print(f"No profiles directory yet at {pdir}")
+            print(f"Create one: mkdir -p {pdir} && put <name>.toml files in it.")
         return
     default = _load_global_config().get("default_profile")
-    print(f"{'NAME':<24}  {'CUSTOMER_ID':<14}  {'DEFAULT':<8}  PACKS ROOT")
-    print("-" * 100)
+
+    profiles = []
     for path in sorted(pdir.glob("*.toml")):
         try:
             with open(path, "rb") as f:
                 p = tomllib.load(f)
+            profiles.append({
+                "name": path.stem,
+                "customer_id": p.get("customer_id"),
+                "packs_root": p.get("packs_root"),
+                "is_default": path.stem == default,
+                "parse_error": None,
+            })
         except Exception as e:
-            print(f"{path.stem:<24}  [parse error: {e}]")
+            profiles.append({
+                "name": path.stem, "customer_id": None, "packs_root": None,
+                "is_default": False, "parse_error": str(e),
+            })
+
+    if args.format == "json":
+        _emit_json({"profiles": profiles, "default_profile": default})
+        return
+
+    print(f"{'NAME':<24}  {'CUSTOMER_ID':<14}  {'DEFAULT':<8}  PACKS ROOT")
+    print("-" * 100)
+    for p in profiles:
+        if p["parse_error"]:
+            print(f"{p['name']:<24}  [parse error: {p['parse_error']}]")
             continue
-        name = path.stem
-        is_default = "✓" if name == default else ""
-        print(f"{name:<24}  {p.get('customer_id', '—'):<14}  {is_default:<8}  {p.get('packs_root', '')}")
+        is_default = "✓" if p["is_default"] else ""
+        print(f"{p['name']:<24}  {p.get('customer_id') or '—':<14}  {is_default:<8}  {p.get('packs_root') or ''}")
 
 
 # ─── Commands: read-only ──────────────────────────────────────────────────
@@ -304,9 +405,28 @@ def cmd_list_campaigns(args):
     ORDER BY campaign.status, campaign.id
     """
     res = api_call("POST", "googleAds:search", {"query": q}, args.customer)
+    rows = res.get("results", [])
+
+    if args.format == "json":
+        out = []
+        for row in rows:
+            c = row["campaign"]
+            cb = row.get("campaignBudget", {})
+            out.append({
+                "id": c["id"],
+                "name": c["name"],
+                "status": c["status"],
+                "channel_type": c["advertisingChannelType"],
+                "bidding_strategy_type": c.get("biddingStrategyType"),
+                "url_expansion_opt_out": c.get("urlExpansionOptOut", False),
+                "budget_units": int(cb.get("amountMicros", 0)) / 1_000_000 if cb.get("amountMicros") else None,
+            })
+        _emit_json(out)
+        return
+
     print(f"{'ID':>12}  {'STATUS':<10}  {'TYPE':<18}  {'BID':<27}  {'BUDGET':<14}  {'URL EXP':<9}  NAME")
     print("-" * 130)
-    for row in res.get("results", []):
+    for row in rows:
         c = row["campaign"]
         cb = row.get("campaignBudget", {})
         url_exp = "OFF" if c.get("urlExpansionOptOut") else "ON"
@@ -458,38 +578,76 @@ def _fmt_delta(curr, prev, kind="pct"):
 def cmd_stats(args):
     start, end = _resolve_date_range(args)
     rows = _fetch_campaign_stats(args, start, end)
-    print(f"Időszak: {start} → {end}  ({(datetime.date.fromisoformat(end) - datetime.date.fromisoformat(start)).days + 1} nap)\n")
+    days = (datetime.date.fromisoformat(end) - datetime.date.fromisoformat(start)).days + 1
 
-    if not rows:
-        print("Nincs adat ebben az időszakban.")
-        return
-
-    print(f"{'CAMPAIGN':<36}  {'COST (HUF)':>12}  {'IMP':>8}  {'CLK':>6}  {'CTR':>6}  {'CPC':>9}  {'CONV':>6}  {'C.VAL':>10}  {'ROAS':>6}  {'IS%':>6}  {'L-BUD':>6}  {'L-RANK':>7}")
-    print("-" * 150)
-    totals = _aggregate(rows)
+    per_campaign = []
     for row in rows:
         c = row["campaign"]
         m = row["metrics"]
         clicks = int(m.get("clicks", 0))
         imp = int(m.get("impressions", 0))
-        cost = int(m.get("costMicros", 0))
-        ctr = (clicks / imp) if imp else 0
-        cpc = (cost / clicks) if clicks else 0
+        cost_micros = int(m.get("costMicros", 0))
         conv = float(m.get("conversions", 0))
         cval = float(m.get("conversionsValue", 0))
-        roas = (cval / (cost / 1_000_000)) if cost else 0
-        is_ = float(m.get("searchImpressionShare", 0))
-        lb = float(m.get("searchBudgetLostImpressionShare", 0))
-        lr = float(m.get("searchRankLostImpressionShare", 0))
-        print(f"{c['name'][:36]:<36}  {cost/1_000_000:>12,.0f}  {imp:>8,}  {clicks:>6,}  {ctr*100:>5.2f}%  "
-              f"{cpc/1_000_000:>8,.0f}  {conv:>6.1f}  {cval:>10,.0f}  {roas:>5.2f}x  "
-              f"{is_*100:>5.1f}%  {lb*100:>5.1f}%  {lr*100:>6.1f}%")
-    if len(rows) > 1:
+        per_campaign.append({
+            "campaign_id": c["id"],
+            "campaign_name": c["name"],
+            "cost_units": cost_micros / 1_000_000,
+            "impressions": imp,
+            "clicks": clicks,
+            "ctr": (clicks / imp) if imp else 0,
+            "avg_cpc_units": (cost_micros / clicks / 1_000_000) if clicks else 0,
+            "conversions": conv,
+            "conversions_value": cval,
+            "roas": (cval / (cost_micros / 1_000_000)) if cost_micros else 0,
+            "search_impression_share":               float(m.get("searchImpressionShare", 0)),
+            "search_budget_lost_impression_share":   float(m.get("searchBudgetLostImpressionShare", 0)),
+            "search_rank_lost_impression_share":     float(m.get("searchRankLostImpressionShare", 0)),
+        })
+
+    totals = _aggregate(rows)
+    summary_block = None
+    if totals:
+        summary_block = {
+            "cost_units": totals["cost"] / 1_000_000,
+            "impressions": totals["imp"],
+            "clicks": totals["clicks"],
+            "ctr": totals["ctr"],
+            "avg_cpc_units": totals["cpc"] / 1_000_000,
+            "conversions": totals["conv"],
+            "conversions_value": totals["conv_value"],
+            "roas": totals["roas"],
+            "search_impression_share":               totals["is"],
+            "search_budget_lost_impression_share":   totals["lost_is_b"],
+            "search_rank_lost_impression_share":     totals["lost_is_r"],
+        }
+
+    if args.format == "json":
+        _emit_json({
+            "period": {"start": start, "end": end, "days": days},
+            "campaigns": per_campaign,
+            "totals": summary_block,
+        })
+        return
+
+    print(f"Period: {start} → {end}  ({days} days)\n")
+    if not rows:
+        print("No data in this period.")
+        return
+
+    print(f"{'CAMPAIGN':<36}  {'COST':>12}  {'IMP':>8}  {'CLK':>6}  {'CTR':>6}  {'CPC':>9}  {'CONV':>6}  {'C.VAL':>10}  {'ROAS':>6}  {'IS%':>6}  {'L-BUD':>6}  {'L-RANK':>7}")
+    print("-" * 150)
+    for c in per_campaign:
+        print(f"{c['campaign_name'][:36]:<36}  {c['cost_units']:>12,.0f}  {c['impressions']:>8,}  {c['clicks']:>6,}  {c['ctr']*100:>5.2f}%  "
+              f"{c['avg_cpc_units']:>8,.0f}  {c['conversions']:>6.1f}  {c['conversions_value']:>10,.0f}  {c['roas']:>5.2f}x  "
+              f"{c['search_impression_share']*100:>5.1f}%  {c['search_budget_lost_impression_share']*100:>5.1f}%  {c['search_rank_lost_impression_share']*100:>6.1f}%")
+    if summary_block and len(per_campaign) > 1:
+        s = summary_block
         print("-" * 150)
-        print(f"{'ÖSSZESEN':<36}  {totals['cost']/1_000_000:>12,.0f}  {totals['imp']:>8,}  {totals['clicks']:>6,}  "
-              f"{totals['ctr']*100:>5.2f}%  {totals['cpc']/1_000_000:>8,.0f}  {totals['conv']:>6.1f}  "
-              f"{totals['conv_value']:>10,.0f}  {totals['roas']:>5.2f}x  "
-              f"{totals['is']*100:>5.1f}%  {totals['lost_is_b']*100:>5.1f}%  {totals['lost_is_r']*100:>6.1f}%")
+        print(f"{'TOTAL':<36}  {s['cost_units']:>12,.0f}  {s['impressions']:>8,}  {s['clicks']:>6,}  "
+              f"{s['ctr']*100:>5.2f}%  {s['avg_cpc_units']:>8,.0f}  {s['conversions']:>6.1f}  "
+              f"{s['conversions_value']:>10,.0f}  {s['roas']:>5.2f}x  "
+              f"{s['search_impression_share']*100:>5.1f}%  {s['search_budget_lost_impression_share']*100:>5.1f}%  {s['search_rank_lost_impression_share']*100:>6.1f}%")
 
 
 def cmd_stats_vs_prev(args):
@@ -499,9 +657,6 @@ def cmd_stats_vs_prev(args):
     end_prev = start_curr - datetime.timedelta(days=1)
     start_prev = end_prev - datetime.timedelta(days=args.days - 1)
 
-    print(f"Utolsó {args.days} nap:    {start_curr} → {end_curr}")
-    print(f"Előző  {args.days} nap:    {start_prev} → {end_prev}\n")
-
     curr_args = argparse.Namespace(customer=args.customer, campaign=args.campaign,
                                     start=start_curr.isoformat(), end=end_curr.isoformat())
     prev_args = argparse.Namespace(customer=args.customer, campaign=args.campaign,
@@ -509,28 +664,49 @@ def cmd_stats_vs_prev(args):
     curr = _aggregate(_fetch_campaign_stats(curr_args, str(start_curr), str(end_curr)))
     prev = _aggregate(_fetch_campaign_stats(prev_args, str(start_prev), str(end_prev)))
 
-    if not curr:
-        print("Nincs adat az aktuális időszakban.")
+    if not curr and args.format != "json":
+        print("No data in the current period.")
         return
     if not prev:
-        prev = {k: 0 for k in curr}
+        prev = {k: 0 for k in (curr or {})}
 
-    rows_to_show = [
-        ("Spend (HUF)",       curr["cost"]/1_000_000,     prev["cost"]/1_000_000,     "{:,.0f}"),
-        ("Impressions",       curr["imp"],                prev["imp"],                "{:,}"),
-        ("Clicks",            curr["clicks"],             prev["clicks"],             "{:,}"),
-        ("CTR (%)",           curr["ctr"]*100,            prev["ctr"]*100,            "{:.2f}"),
-        ("Avg CPC (HUF)",     curr["cpc"]/1_000_000,      prev["cpc"]/1_000_000,      "{:,.0f}"),
-        ("Conversions",       curr["conv"],               prev["conv"],               "{:.1f}"),
-        ("Conv. value (HUF)", curr["conv_value"],         prev["conv_value"],         "{:,.0f}"),
-        ("ROAS",              curr["roas"],               prev["roas"],               "{:.2f}x"),
-        ("Search IS (%)",     curr["is"]*100,             prev["is"]*100,             "{:.1f}"),
-        ("Lost IS budget (%)",curr["lost_is_b"]*100,      prev["lost_is_b"]*100,      "{:.1f}"),
-        ("Lost IS rank (%)",  curr["lost_is_r"]*100,      prev["lost_is_r"]*100,      "{:.1f}"),
+    metrics = [
+        ("spend_units",                          curr.get("cost", 0)/1_000_000      if curr else 0,  prev["cost"]/1_000_000,    "{:,.0f}"),
+        ("impressions",                          curr.get("imp", 0)                  if curr else 0,  prev["imp"],               "{:,}"),
+        ("clicks",                               curr.get("clicks", 0)               if curr else 0,  prev["clicks"],            "{:,}"),
+        ("ctr_pct",                              (curr.get("ctr", 0) or 0)*100       if curr else 0,  prev["ctr"]*100,           "{:.2f}"),
+        ("avg_cpc_units",                        curr.get("cpc", 0)/1_000_000        if curr else 0,  prev["cpc"]/1_000_000,     "{:,.0f}"),
+        ("conversions",                          curr.get("conv", 0)                 if curr else 0,  prev["conv"],              "{:.1f}"),
+        ("conv_value_units",                     curr.get("conv_value", 0)           if curr else 0,  prev["conv_value"],        "{:,.0f}"),
+        ("roas",                                 curr.get("roas", 0)                 if curr else 0,  prev["roas"],              "{:.2f}x"),
+        ("search_impression_share_pct",          (curr.get("is", 0) or 0)*100        if curr else 0,  prev["is"]*100,            "{:.1f}"),
+        ("lost_is_budget_pct",                   (curr.get("lost_is_b", 0) or 0)*100 if curr else 0,  prev["lost_is_b"]*100,     "{:.1f}"),
+        ("lost_is_rank_pct",                     (curr.get("lost_is_r", 0) or 0)*100 if curr else 0,  prev["lost_is_r"]*100,     "{:.1f}"),
     ]
+
+    if args.format == "json":
+        _emit_json({
+            "period_current":  {"start": start_curr.isoformat(), "end": end_curr.isoformat(), "days": args.days},
+            "period_previous": {"start": start_prev.isoformat(), "end": end_prev.isoformat(), "days": args.days},
+            "metrics": [{"key": k, "current": c, "previous": p,
+                         "delta_pct": ((c - p) / abs(p) * 100) if p else None}
+                        for k, c, p, _ in metrics],
+        })
+        return
+
+    print(f"Current {args.days} days:  {start_curr} → {end_curr}")
+    print(f"Previous {args.days} days: {start_prev} → {end_prev}\n")
     print(f"{'METRIC':<22}  {'CURR':>14}  {'PREV':>14}  {'Δ':>8}")
     print("-" * 65)
-    for label, c, p, fmt in rows_to_show:
+    labels = {
+        "spend_units": "Spend (units)", "impressions": "Impressions", "clicks": "Clicks",
+        "ctr_pct": "CTR (%)", "avg_cpc_units": "Avg CPC (units)",
+        "conversions": "Conversions", "conv_value_units": "Conv. value",
+        "roas": "ROAS", "search_impression_share_pct": "Search IS (%)",
+        "lost_is_budget_pct": "Lost IS budget (%)", "lost_is_rank_pct": "Lost IS rank (%)",
+    }
+    for key, c, p, fmt in metrics:
+        label = labels.get(key, key)
         print(f"{label:<22}  {fmt.format(c):>14}  {fmt.format(p):>14}  {_fmt_delta(c, p):>8}")
 
 
@@ -1577,32 +1753,46 @@ def cmd_cleanup_orphans(args):
 
     budgets, assets = [], []
     if target in ("budget", "all"):
-        print("Scanning for orphan campaign budgets...")
+        if args.format != "json":
+            print("Scanning for orphan campaign budgets...")
         budgets = _orphan_budgets(args.customer)
-        print(f"  Found {len(budgets)} orphan budget(s).\n")
-        for bid, name, micros in budgets:
-            print(f"    {bid}  {micros_to_units(micros):>10} /day  {name}")
+        if args.format != "json":
+            print(f"  Found {len(budgets)} orphan budget(s).\n")
+            for bid, name, micros in budgets:
+                print(f"    {bid}  {micros_to_units(micros):>10} /day  {name}")
 
     if target in ("asset", "all"):
-        print("\nScanning for orphan text assets...")
+        if args.format != "json":
+            print("\nScanning for orphan text assets...")
         assets = _orphan_text_assets(args.customer)
-        print(f"  Found {len(assets)} orphan text asset(s).\n")
-        for aid, text in assets[:50]:
-            preview = text[:60] + ("..." if len(text) > 60 else "")
-            print(f"    {aid:>14}  {preview}")
-        if len(assets) > 50:
-            print(f"    ... and {len(assets) - 50} more")
-        if assets:
-            print("\n  ⚠️  This scan checks asset_group_asset, customer_asset, and")
-            print("      campaign_asset link tables. Text assets used inside RSA")
-            print("      headlines/descriptions are linked via ad_group_ad_asset_view")
-            print("      and may show as orphan here even though Google references")
-            print("      them. If you see RSA copy in this list, the API will refuse")
-            print("      to delete an in-use asset (RESOURCE_IN_USE) — safe to try.")
+        if args.format != "json":
+            print(f"  Found {len(assets)} orphan text asset(s).\n")
+            for aid, text in assets[:50]:
+                preview = text[:60] + ("..." if len(text) > 60 else "")
+                print(f"    {aid:>14}  {preview}")
+            if len(assets) > 50:
+                print(f"    ... and {len(assets) - 50} more")
+            if assets:
+                print("\n  ⚠️  This scan checks asset_group_asset, customer_asset, and")
+                print("      campaign_asset link tables. Text assets used inside RSA")
+                print("      headlines/descriptions are linked via ad_group_ad_asset_view")
+                print("      and may show as orphan here even though Google references")
+                print("      them. If you see RSA copy in this list, the API will refuse")
+                print("      to delete an in-use asset (RESOURCE_IN_USE) — safe to try.")
+
+    if args.format == "json":
+        _emit_json({
+            "orphan_budgets": [{"id": b[0], "name": b[1], "daily_units": b[2]/1_000_000} for b in budgets],
+            "orphan_text_assets": [{"id": a[0], "text": a[1]} for a in assets],
+            "apply": args.apply,
+        })
+        if not args.apply:
+            return
 
     total = len(budgets) + len(assets)
     if total == 0:
-        print("\n✓ No orphans found.")
+        if args.format != "json":
+            print("\n✓ No orphans found.")
         return
 
     if not args.apply:
@@ -1639,9 +1829,13 @@ def main():
     parser.add_argument("--profile", default=None,
                         help="Profile name from ~/.config/gads/profiles/<name>.toml "
                              "(or set GADS_PROFILE env or default_profile in config.toml)")
+    parser.add_argument("--format", default="table", choices=["table", "json"],
+                        help="Output format for read commands (default: table)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("list-profiles").set_defaults(func=cmd_list_profiles)
+    sub.add_parser("commands",
+                   help="Self-describing command manifest (always JSON)").set_defaults(func=cmd_commands)
     sub.add_parser("list-campaigns").set_defaults(func=cmd_list_campaigns)
     sub.add_parser("list-conversions").set_defaults(func=cmd_list_conversions)
     sub.add_parser("list-recommendations").set_defaults(func=cmd_list_recommendations)
@@ -1804,8 +1998,8 @@ def main():
     p.set_defaults(func=cmd_create_brand_campaign)
 
     args = parser.parse_args()
-    # list-profiles doesn't need a customer; everything else does.
-    if args.cmd != "list-profiles":
+    # list-profiles and commands don't need a customer; everything else does.
+    if args.cmd not in ("list-profiles", "commands"):
         args.customer = _resolve_customer(args)
     args.func(args)
 
