@@ -1,0 +1,57 @@
+# Brand Search campaign config. Used by:
+#   gads create-brand-campaign --pack <this-file>
+#
+# The campaign is created PAUSED by default — review in the Ads UI and
+# enable manually once you've sanity-checked the keywords + RSA copy.
+
+name              = "Brand Search - ACME"
+final_url         = "https://www.example.com/"
+daily_budget      = 50                  # in account currency
+bidding_strategy  = "MAXIMIZE_CONVERSIONS"   # or TARGET_CPA, MANUAL_CPC
+status_on_create  = "PAUSED"
+ad_group_bid      = 1                   # safety cpc floor (account currency)
+
+# RSA: min 3 headlines, min 2 descriptions. Up to 15 headlines + 4 descriptions.
+# Character limits enforced: headlines 30, descriptions 90.
+# Top-level fields/arrays MUST come BEFORE any [[table]] block.
+
+headlines = [
+  "ACME Tires — Official Site",
+  "Premium Tires, Fast Shipping",
+  "30-Day Returns, Free Delivery",
+  "Trusted by 50K+ Drivers",
+  "Buy ACME Direct & Save",
+  "Authorised ACME Dealer",
+  "Talk to a Tire Expert Today",
+  "All Sizes In Stock",
+]
+
+descriptions = [
+  "Shop the full ACME catalogue direct from the manufacturer. Free shipping over $99.",
+  "30-day money-back guarantee on every ACME tire. Expert advice from real humans.",
+  "All ACME tire sizes available. Premium, Standard, Eco lines — same-day dispatch.",
+  "Buy ACME tires direct & save up to 25% vs retail. Talk to an expert: Mon-Fri 9-6.",
+]
+
+# Keywords — match types: EXACT, PHRASE, BROAD.
+# Brand campaigns work best with EXACT + PHRASE on the brand name & variants.
+
+[[keywords]]
+text = "acme tires"
+match_type = "EXACT"
+
+[[keywords]]
+text = "acme tire"
+match_type = "EXACT"
+
+[[keywords]]
+text = "acme tires official"
+match_type = "PHRASE"
+
+[[keywords]]
+text = "acme.com tires"
+match_type = "PHRASE"
+
+[[keywords]]
+text = "buy acme tires online"
+match_type = "PHRASE"

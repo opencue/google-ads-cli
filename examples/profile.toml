@@ -1,0 +1,25 @@
+# Example profile — copy to ~/.config/gads/profiles/<your-account-name>.toml
+# and edit. Then either:
+#   echo 'default_profile = "<your-account-name>"' > ~/.config/gads/config.toml
+# or pass --profile <name> to every gads invocation.
+
+customer_id = "1234567890"
+# login_customer_id = "9876543210"     # set if this account is under an MCC
+
+# Where pack files live. Either an absolute path or relative to this profile.
+packs_root = "/home/youruser/projects/myaccount/gads-packs"
+
+[brand]
+name = "ACME Tires"
+homepage = "https://www.example.com/"
+
+[locale]
+language = "en"
+currency = "USD"
+# Geo target constants. United States = 2840.
+# Full list: https://developers.google.com/google-ads/api/data/geotargets
+geo_targets = [2840]
+
+[defaults]
+campaign_status_on_create = "PAUSED"    # safety: human enables after review
+url_check_before_apply = true           # HEAD-check sitelink URLs

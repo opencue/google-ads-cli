@@ -1,0 +1,61 @@
+# Account-level (customer-scope) sitelinks, callouts, structured snippets.
+# Used by:  gads seed-account-assets --pack <this-file>
+#
+# Character limits enforced by the CLI:
+#   sitelink text: 25  |  sitelink d1/d2: 35  |  callout: 25  |  snippet value: 25
+#
+# Snippet header MUST be a Google-defined enum (in English). Allowed:
+#   Brands, Types, Models, Styles, Service catalog, Amenities,
+#   Featured hotels, Insurance coverage, Courses, Degree programs,
+#   Destinations, Neighborhoods, Shows.
+# Google localises the display per account language. Arbitrary text rejected.
+#
+# TOML scoping note: top-level scalars/arrays MUST precede ALL [section]
+# and [[table]] blocks. So `callouts = [...]` goes up here.
+
+callouts = [
+  "Free shipping on $99+",
+  "30-day return policy",
+  "24/7 customer support",
+  "Authorised dealer",
+  "Buy now, pay later",
+  "In-stock guarantee",
+]
+
+[[sitelinks]]
+text = "All products"
+url  = "https://www.example.com/products"
+d1   = "Browse the full catalogue"
+d2   = "New arrivals every week"
+
+[[sitelinks]]
+text = "Best sellers"
+url  = "https://www.example.com/best-sellers"
+d1   = "Most-loved by customers"
+d2   = "Top 50 picks"
+
+[[sitelinks]]
+text = "Special offers"
+url  = "https://www.example.com/sale"
+d1   = "Limited-time discounts"
+d2   = "Up to 50% off"
+
+[[sitelinks]]
+text = "About us"
+url  = "https://www.example.com/about"
+d1   = "Family-owned since 2010"
+d2   = "Trusted by 50,000 customers"
+
+[[sitelinks]]
+text = "Contact"
+url  = "https://www.example.com/contact"
+d1   = "Talk to a human"
+d2   = "Mon-Fri 9am-6pm EST"
+
+[[snippets]]
+header = "Brands"
+values = ["BrandA", "BrandB", "BrandC", "BrandD"]
+
+[[snippets]]
+header = "Types"
+values = ["Premium", "Standard", "Eco", "Industrial"]

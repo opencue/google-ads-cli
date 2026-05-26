@@ -1,0 +1,1634 @@
+#!/usr/bin/env python3
+"""gads — portable Google Ads CLI
+
+Auth: GOOGLE_ADS_DEVELOPER_TOKEN env var + `gcloud auth application-default
+print-access-token`. Pick the account via --profile <name> (preferred),
+GADS_PROFILE env var, default_profile in ~/.config/gads/config.toml, or
+explicit --customer <id>.
+
+Profiles live in ~/.config/gads/profiles/<name>.toml and define customer_id,
+locale, packs_root, etc. Bulk commands consume per-account TOML packs.
+
+All mutating commands run as DRY-RUN by default. Add --apply to commit.
+
+Commands (read-only):
+  list-campaigns                              Aktív kampányok + budget + bid stratégia
+  list-conversions                            Conversion action-ök listája
+  list-assets <asset_group_id>                Asset-ek egy asset group-ban
+  list-recommendations                        Pending Google ajánlások
+  gaql "<query>"                              Tetszőleges GAQL query (debug)
+
+Commands (mutating — kell --apply):
+  delete-conversion <id> [--apply]            Conversion action törlése
+  disable-url-expansion <campaign_id> [--apply]   PMAX URL expansion OFF
+  enable-url-expansion <campaign_id> [--apply]    PMAX URL expansion ON
+  set-bid <campaign_id> --strategy <S> [--target <X>] [--apply]
+      Bid strategy váltás. S ∈ {TARGET_CPA, TARGET_ROAS,
+      MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE}
+      --target CPA esetén HUF, ROAS esetén szám (pl. 4.0 = 4x)
+  set-budget <campaign_id> --daily <HUF> [--apply]    Napi budget HUF-ban
+
+Commands (performance — read-only):
+  stats [--days N | --start YYYY-MM-DD --end YYYY-MM-DD] [--campaign ID]
+      Kampány-szintű KPI-k egy időszakra (cost, imp, clicks, ctr, cpc, conv,
+      conv_value, IS, lost_is_budget, lost_is_rank).
+  stats-vs-prev --days N [--campaign ID]
+      Utolsó N nap vs előző N nap delta táblázat — 2-hetes riportokhoz.
+  list-adgroups [--campaign ID] [--status ENABLED]
+      Ad group-ok listája — Brand Search kampány előkészítéséhez.
+  list-keywords [--campaign ID] [--ad-group ID] [--status ENABLED]
+      Keyword-ök match-type-pal, quality score-val, bid-del.
+
+Commands (account-level asset extensions):
+  list-account-assets                         Aktuális account-level sitelink/callout/snippet-ek
+  add-sitelink <text> <url> [--d1 <s>] [--d2 <s>] [--apply]
+      Sitelink + customer link. text max 25, d1/d2 max 35 kar.
+  add-callout <text> [--apply]                Callout asset (text max 25 kar)
+  add-snippet <header> <val>... [--apply]     Structured snippet (min 3 érték)
+  seed-account-assets [--apply]               Bulk: 6 sitelink + 6 callout + Stílus snippet
+      Az implementation-pack §A.4–A.6 alapján. Idempotens check:
+      ha már van bármilyen account-level asset, figyelmeztet.
+
+Commands (asset group + campaign creation):
+  replace-headlines <asset_group_id> --pack {superway|hubtrac|szerelo} [--apply]
+      Headline pack csere atomic batch-csel (12 remove + 10 add egy hívásban).
+      Implementation-pack §A.1 alapján.
+  create-brand-campaign [--name <s>] [--budget <HUF>] [--final-url <url>] [--apply]
+      Új Brand Search kampány: budget + campaign + geo + ad group + keywords + RSA.
+      PAUSED állapotban jön létre — review után te enabled-eled.
+
+Példák:
+  gads list-campaigns
+  gads list-conversions
+  gads delete-conversion 7617152372              # dry-run
+  gads delete-conversion 7617152372 --apply      # tényleg törli
+  gads disable-url-expansion 23857652151 --apply
+  gads set-bid 23857652151 --strategy TARGET_CPA --target 5000 --apply
+  gads set-budget 23857652151 --daily 5000 --apply
+"""
+
+import argparse
+import base64
+import datetime
+import json
+import os
+import subprocess
+import sys
+import tomllib
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+API_VERSION = "v21"
+API_BASE = f"https://googleads.googleapis.com/{API_VERSION}"
+
+# ─── Profile / pack loaders ───────────────────────────────────────────────
+#
+# A profile is a TOML file under ~/.config/gads/profiles/<name>.toml that
+# describes a Google Ads account (customer_id, locale, packs_root, etc.).
+# A pack is a TOML file with bulk content (sitelinks, headlines, brand
+# config) that bulk commands consume via --pack <path>.
+
+_GADS_CONFIG_DIR = Path.home() / ".config" / "gads"
+_loaded_profile_cache = None
+
+
+def _load_global_config():
+    cfg_path = _GADS_CONFIG_DIR / "config.toml"
+    if not cfg_path.exists():
+        return {}
+    with open(cfg_path, "rb") as f:
+        return tomllib.load(f)
+
+
+def _load_profile(name=None):
+    """Resolve and load a profile TOML. Search order:
+    1. explicit `name` arg (typically from --profile flag)
+    2. GADS_PROFILE env var
+    3. default_profile in ~/.config/gads/config.toml
+    Returns None if no profile is configured (commands then need --customer).
+    """
+    global _loaded_profile_cache
+    if _loaded_profile_cache and not name:
+        return _loaded_profile_cache
+    name = name or os.environ.get("GADS_PROFILE")
+    if not name:
+        name = _load_global_config().get("default_profile")
+    if not name:
+        return None
+    path = _GADS_CONFIG_DIR / "profiles" / f"{name}.toml"
+    if not path.exists():
+        sys.exit(f"ERROR: profile '{name}' nem található: {path}")
+    with open(path, "rb") as f:
+        prof = tomllib.load(f)
+    prof["_name"] = name
+    _loaded_profile_cache = prof
+    return prof
+
+
+def _resolve_customer(args):
+    """Return a customer_id. Order: --customer arg, profile, env, error."""
+    if getattr(args, "customer", None):
+        return str(args.customer)
+    prof = _load_profile(getattr(args, "profile", None))
+    if prof and prof.get("customer_id"):
+        return str(prof["customer_id"])
+    env_cid = os.environ.get("GOOGLE_ADS_CUSTOMER_ID", "").strip()
+    if env_cid:
+        return env_cid
+    sys.exit("ERROR: nincs customer_id. Adj meg --customer XXXX vagy állíts be "
+             "profile-t (~/.config/gads/profiles/<name>.toml + default_profile).")
+
+
+def _load_pack(pack_arg, profile=None):
+    """Load a pack TOML. `pack_arg` is the value passed to --pack; can be an
+    absolute path, a relative path (resolved against profile.packs_root), or
+    a bare name like 'superway' (resolved as <packs_root>/<name>.toml or
+    <packs_root>/brands/<name>.toml)."""
+    if not pack_arg:
+        sys.exit("ERROR: --pack kötelező ennél a parancsnál.")
+    p = Path(pack_arg)
+    if p.is_absolute() and p.exists():
+        with open(p, "rb") as f:
+            return tomllib.load(f)
+    if profile and profile.get("packs_root"):
+        root = Path(profile["packs_root"])
+        for candidate in (
+            root / pack_arg,
+            root / f"{pack_arg}.toml",
+            root / "brands" / f"{pack_arg}.toml",
+        ):
+            if candidate.exists():
+                with open(candidate, "rb") as f:
+                    return tomllib.load(f)
+    if p.exists():
+        with open(p, "rb") as f:
+            return tomllib.load(f)
+    sys.exit(f"ERROR: pack file nem található: {pack_arg}")
+
+
+# ─── Auth helpers ──────────────────────────────────────────────────────────
+
+def env_or_die(name):
+    val = os.environ.get(name, "").strip()
+    if not val:
+        sys.exit(f"ERROR: {name} env nincs beállítva. Source-old a ~/.bashrc-t.")
+    return val
+
+
+_access_token_cache = None
+
+def get_access_token():
+    """Get fresh ADC access token via gcloud (cached per-invocation)."""
+    global _access_token_cache
+    if _access_token_cache:
+        return _access_token_cache
+    try:
+        result = subprocess.run(
+            ["gcloud", "auth", "application-default", "print-access-token"],
+            capture_output=True, text=True, check=True,
+        )
+        _access_token_cache = result.stdout.strip()
+        return _access_token_cache
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"ERROR: gcloud ADC token nem elérhető:\n{e.stderr}")
+    except FileNotFoundError:
+        sys.exit("ERROR: gcloud nincs telepítve / nincs a PATH-ban.")
+
+
+def api_call(method, path, body=None, customer_id=None):
+    if not customer_id:
+        sys.exit("ERROR: api_call requires customer_id (bug: caller didn't pass one)")
+    """Make a Google Ads REST API call. path is relative to /customers/{id}/."""
+    url = f"{API_BASE}/customers/{customer_id}/{path}"
+    headers = {
+        "Authorization": f"Bearer {get_access_token()}",
+        "developer-token": env_or_die("GOOGLE_ADS_DEVELOPER_TOKEN"),
+        "Content-Type": "application/json",
+    }
+    login_cid = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID", "").strip()
+    if login_cid:
+        headers["login-customer-id"] = login_cid
+
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, method=method, headers=headers, data=data)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode(errors="replace")
+        try:
+            err_json = json.loads(err_body)
+            msg = json.dumps(err_json, indent=2, ensure_ascii=False)
+        except Exception:
+            msg = err_body
+        sys.exit(f"API HIBA {e.code} {e.reason}\n{msg}")
+
+
+# ─── Display helpers ──────────────────────────────────────────────────────
+
+def micros_to_huf(micros):
+    if micros is None:
+        return "—"
+    return f"{int(micros) / 1_000_000:.0f} HUF"
+
+
+def dry_run_banner(action, target):
+    print(f"  ╭──────────────────────────────────────────────────────────╮")
+    print(f"  │  DRY RUN — semmi nem ment fel az API-hoz                 │")
+    print(f"  │  {action}: {target:<54.54}│")
+    print(f"  │  Re-run --apply flag-gel hogy tényleg megtörténjen.      │")
+    print(f"  ╰──────────────────────────────────────────────────────────╯")
+
+
+# ─── Commands: profile listing ────────────────────────────────────────────
+
+def cmd_list_profiles(args):
+    pdir = _GADS_CONFIG_DIR / "profiles"
+    if not pdir.exists():
+        print(f"No profiles directory yet at {pdir}")
+        print(f"Create one: mkdir -p {pdir} && put <name>.toml files in it.")
+        return
+    default = _load_global_config().get("default_profile")
+    print(f"{'NAME':<24}  {'CUSTOMER_ID':<14}  {'DEFAULT':<8}  PACKS ROOT")
+    print("-" * 100)
+    for path in sorted(pdir.glob("*.toml")):
+        try:
+            with open(path, "rb") as f:
+                p = tomllib.load(f)
+        except Exception as e:
+            print(f"{path.stem:<24}  [parse error: {e}]")
+            continue
+        name = path.stem
+        is_default = "✓" if name == default else ""
+        print(f"{name:<24}  {p.get('customer_id', '—'):<14}  {is_default:<8}  {p.get('packs_root', '')}")
+
+
+# ─── Commands: read-only ──────────────────────────────────────────────────
+
+def cmd_list_campaigns(args):
+    q = """
+    SELECT
+      campaign.id, campaign.name, campaign.status,
+      campaign.advertising_channel_type, campaign.bidding_strategy_type,
+      campaign.url_expansion_opt_out, campaign_budget.amount_micros
+    FROM campaign
+    WHERE campaign.status != 'REMOVED'
+    ORDER BY campaign.status, campaign.id
+    """
+    res = api_call("POST", "googleAds:search", {"query": q}, args.customer)
+    print(f"{'ID':>12}  {'STATUS':<10}  {'TYPE':<18}  {'BID':<27}  {'BUDGET':<14}  {'URL EXP':<9}  NAME")
+    print("-" * 130)
+    for row in res.get("results", []):
+        c = row["campaign"]
+        cb = row.get("campaignBudget", {})
+        url_exp = "OFF" if c.get("urlExpansionOptOut") else "ON"
+        print(f"{c['id']:>12}  {c['status']:<10}  {c['advertisingChannelType']:<18}  "
+              f"{c.get('biddingStrategyType', '-'):<27}  "
+              f"{micros_to_huf(cb.get('amountMicros')):<14}  "
+              f"{url_exp:<9}  {c['name']}")
+
+
+def cmd_list_conversions(args):
+    q = """
+    SELECT
+      conversion_action.id, conversion_action.name, conversion_action.status,
+      conversion_action.type, conversion_action.category,
+      conversion_action.primary_for_goal
+    FROM conversion_action
+    ORDER BY conversion_action.status, conversion_action.id
+    """
+    res = api_call("POST", "googleAds:search", {"query": q}, args.customer)
+    print(f"{'ID':>12}  {'STATUS':<10}  {'TYPE':<22}  {'CATEGORY':<14}  {'PRIMARY':<8}  NAME")
+    print("-" * 130)
+    for row in res.get("results", []):
+        ca = row["conversionAction"]
+        primary = "YES" if ca.get("primaryForGoal") else "—"
+        print(f"{ca['id']:>12}  {ca['status']:<10}  {ca['type']:<22}  "
+              f"{ca['category']:<14}  {primary:<8}  {ca['name']}")
+
+
+def cmd_list_assets(args):
+    q = f"""
+    SELECT
+      asset_group_asset.field_type, asset_group_asset.status,
+      asset.id, asset.type, asset.text_asset.text
+    FROM asset_group_asset
+    WHERE asset_group.id = {args.asset_group_id}
+      AND asset_group_asset.status != 'REMOVED'
+    ORDER BY asset_group_asset.field_type
+    """
+    res = api_call("POST", "googleAds:search", {"query": q}, args.customer)
+    print(f"{'ASSET ID':>14}  {'FIELD TYPE':<24}  {'STATUS':<10}  TEXT / TYPE")
+    print("-" * 120)
+    for row in res.get("results", []):
+        aga = row["assetGroupAsset"]
+        a = row["asset"]
+        text = a.get("textAsset", {}).get("text", "")[:60] or f"[{a.get('type', '?')}]"
+        print(f"{a['id']:>14}  {aga['fieldType']:<24}  {aga['status']:<10}  {text}")
+
+
+def cmd_list_recommendations(args):
+    q = """
+    SELECT recommendation.type, recommendation.resource_name, recommendation.dismissed
+    FROM recommendation
+    """
+    res = api_call("POST", "googleAds:search", {"query": q}, args.customer)
+    rows = res.get("results", [])
+    if not rows:
+        print("Nincs pending recommendation.")
+        return
+    print(f"{'TYPE':<40}  {'DISMISSED':<10}  RESOURCE")
+    print("-" * 120)
+    for row in rows:
+        r = row["recommendation"]
+        dismissed = "YES" if r.get("dismissed") else "—"
+        print(f"{r['type']:<40}  {dismissed:<10}  {r['resourceName']}")
+
+
+def cmd_gaql(args):
+    res = api_call("POST", "googleAds:search", {"query": args.query}, args.customer)
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+
+
+# ─── Performance / stats commands ─────────────────────────────────────────
+
+def _resolve_date_range(args):
+    """Returns (start, end) as YYYY-MM-DD strings."""
+    today = datetime.date.today()
+    if getattr(args, "start", None) and getattr(args, "end", None):
+        return args.start, args.end
+    days = getattr(args, "days", None) or 30
+    end = today - datetime.timedelta(days=1)  # yesterday (today's data incomplete)
+    start = end - datetime.timedelta(days=days - 1)
+    return start.isoformat(), end.isoformat()
+
+
+_PERF_FIELDS = [
+    "metrics.impressions",
+    "metrics.clicks",
+    "metrics.cost_micros",
+    "metrics.ctr",
+    "metrics.average_cpc",
+    "metrics.conversions",
+    "metrics.conversions_value",
+    "metrics.search_impression_share",
+    "metrics.search_budget_lost_impression_share",
+    "metrics.search_rank_lost_impression_share",
+]
+
+
+def _fetch_campaign_stats(args, start, end):
+    """Returns list of {campaign_id, campaign_name, ...metrics}."""
+    fields = ["campaign.id", "campaign.name"] + _PERF_FIELDS
+    where = [f"segments.date BETWEEN '{start}' AND '{end}'",
+             "campaign.status != 'REMOVED'"]
+    if getattr(args, "campaign", None):
+        where.append(f"campaign.id = {args.campaign}")
+    q = f"SELECT {', '.join(fields)} FROM campaign WHERE {' AND '.join(where)}"
+    res = api_call("POST", "googleAds:search", {"query": q}, args.customer)
+    return res.get("results", [])
+
+
+def _aggregate(rows):
+    """Sum metrics across rows. Returns dict with derived rates."""
+    if not rows:
+        return None
+    agg = {"cost": 0, "imp": 0, "clicks": 0, "conv": 0.0, "conv_value": 0.0}
+    # IS metrics are share-of-search-eligible — we average them (approximation;
+    # exact aggregation requires impression-weighted, but for a single
+    # account-wide reporting view this is close enough).
+    is_vals = {"is": [], "lost_b": [], "lost_r": []}
+    for row in rows:
+        m = row.get("metrics", {})
+        agg["cost"] += int(m.get("costMicros", 0))
+        agg["imp"] += int(m.get("impressions", 0))
+        agg["clicks"] += int(m.get("clicks", 0))
+        agg["conv"] += float(m.get("conversions", 0))
+        agg["conv_value"] += float(m.get("conversionsValue", 0))
+        if "searchImpressionShare" in m: is_vals["is"].append(float(m["searchImpressionShare"]))
+        if "searchBudgetLostImpressionShare" in m: is_vals["lost_b"].append(float(m["searchBudgetLostImpressionShare"]))
+        if "searchRankLostImpressionShare" in m: is_vals["lost_r"].append(float(m["searchRankLostImpressionShare"]))
+
+    agg["ctr"] = agg["clicks"] / agg["imp"] if agg["imp"] else 0
+    agg["cpc"] = agg["cost"] / agg["clicks"] if agg["clicks"] else 0
+    agg["roas"] = agg["conv_value"] / (agg["cost"] / 1_000_000) if agg["cost"] else 0
+    agg["is"] = sum(is_vals["is"]) / len(is_vals["is"]) if is_vals["is"] else 0
+    agg["lost_is_b"] = sum(is_vals["lost_b"]) / len(is_vals["lost_b"]) if is_vals["lost_b"] else 0
+    agg["lost_is_r"] = sum(is_vals["lost_r"]) / len(is_vals["lost_r"]) if is_vals["lost_r"] else 0
+    return agg
+
+
+def _fmt_delta(curr, prev, kind="pct"):
+    """Return "+12%" / "-3%" / "—" string for delta display."""
+    if prev == 0 and curr == 0: return "—"
+    if prev == 0: return "+∞" if curr > 0 else "—"
+    d = (curr - prev) / abs(prev) * 100
+    sign = "+" if d >= 0 else ""
+    return f"{sign}{d:.0f}%"
+
+
+def cmd_stats(args):
+    start, end = _resolve_date_range(args)
+    rows = _fetch_campaign_stats(args, start, end)
+    print(f"Időszak: {start} → {end}  ({(datetime.date.fromisoformat(end) - datetime.date.fromisoformat(start)).days + 1} nap)\n")
+
+    if not rows:
+        print("Nincs adat ebben az időszakban.")
+        return
+
+    print(f"{'CAMPAIGN':<36}  {'COST (HUF)':>12}  {'IMP':>8}  {'CLK':>6}  {'CTR':>6}  {'CPC':>9}  {'CONV':>6}  {'C.VAL':>10}  {'ROAS':>6}  {'IS%':>6}  {'L-BUD':>6}  {'L-RANK':>7}")
+    print("-" * 150)
+    totals = _aggregate(rows)
+    for row in rows:
+        c = row["campaign"]
+        m = row["metrics"]
+        clicks = int(m.get("clicks", 0))
+        imp = int(m.get("impressions", 0))
+        cost = int(m.get("costMicros", 0))
+        ctr = (clicks / imp) if imp else 0
+        cpc = (cost / clicks) if clicks else 0
+        conv = float(m.get("conversions", 0))
+        cval = float(m.get("conversionsValue", 0))
+        roas = (cval / (cost / 1_000_000)) if cost else 0
+        is_ = float(m.get("searchImpressionShare", 0))
+        lb = float(m.get("searchBudgetLostImpressionShare", 0))
+        lr = float(m.get("searchRankLostImpressionShare", 0))
+        print(f"{c['name'][:36]:<36}  {cost/1_000_000:>12,.0f}  {imp:>8,}  {clicks:>6,}  {ctr*100:>5.2f}%  "
+              f"{cpc/1_000_000:>8,.0f}  {conv:>6.1f}  {cval:>10,.0f}  {roas:>5.2f}x  "
+              f"{is_*100:>5.1f}%  {lb*100:>5.1f}%  {lr*100:>6.1f}%")
+    if len(rows) > 1:
+        print("-" * 150)
+        print(f"{'ÖSSZESEN':<36}  {totals['cost']/1_000_000:>12,.0f}  {totals['imp']:>8,}  {totals['clicks']:>6,}  "
+              f"{totals['ctr']*100:>5.2f}%  {totals['cpc']/1_000_000:>8,.0f}  {totals['conv']:>6.1f}  "
+              f"{totals['conv_value']:>10,.0f}  {totals['roas']:>5.2f}x  "
+              f"{totals['is']*100:>5.1f}%  {totals['lost_is_b']*100:>5.1f}%  {totals['lost_is_r']*100:>6.1f}%")
+
+
+def cmd_stats_vs_prev(args):
+    today = datetime.date.today()
+    end_curr = today - datetime.timedelta(days=1)
+    start_curr = end_curr - datetime.timedelta(days=args.days - 1)
+    end_prev = start_curr - datetime.timedelta(days=1)
+    start_prev = end_prev - datetime.timedelta(days=args.days - 1)
+
+    print(f"Utolsó {args.days} nap:    {start_curr} → {end_curr}")
+    print(f"Előző  {args.days} nap:    {start_prev} → {end_prev}\n")
+
+    curr_args = argparse.Namespace(customer=args.customer, campaign=args.campaign,
+                                    start=start_curr.isoformat(), end=end_curr.isoformat())
+    prev_args = argparse.Namespace(customer=args.customer, campaign=args.campaign,
+                                    start=start_prev.isoformat(), end=end_prev.isoformat())
+    curr = _aggregate(_fetch_campaign_stats(curr_args, str(start_curr), str(end_curr)))
+    prev = _aggregate(_fetch_campaign_stats(prev_args, str(start_prev), str(end_prev)))
+
+    if not curr:
+        print("Nincs adat az aktuális időszakban.")
+        return
+    if not prev:
+        prev = {k: 0 for k in curr}
+
+    rows_to_show = [
+        ("Spend (HUF)",       curr["cost"]/1_000_000,     prev["cost"]/1_000_000,     "{:,.0f}"),
+        ("Impressions",       curr["imp"],                prev["imp"],                "{:,}"),
+        ("Clicks",            curr["clicks"],             prev["clicks"],             "{:,}"),
+        ("CTR (%)",           curr["ctr"]*100,            prev["ctr"]*100,            "{:.2f}"),
+        ("Avg CPC (HUF)",     curr["cpc"]/1_000_000,      prev["cpc"]/1_000_000,      "{:,.0f}"),
+        ("Conversions",       curr["conv"],               prev["conv"],               "{:.1f}"),
+        ("Conv. value (HUF)", curr["conv_value"],         prev["conv_value"],         "{:,.0f}"),
+        ("ROAS",              curr["roas"],               prev["roas"],               "{:.2f}x"),
+        ("Search IS (%)",     curr["is"]*100,             prev["is"]*100,             "{:.1f}"),
+        ("Lost IS budget (%)",curr["lost_is_b"]*100,      prev["lost_is_b"]*100,      "{:.1f}"),
+        ("Lost IS rank (%)",  curr["lost_is_r"]*100,      prev["lost_is_r"]*100,      "{:.1f}"),
+    ]
+    print(f"{'METRIC':<22}  {'CURR':>14}  {'PREV':>14}  {'Δ':>8}")
+    print("-" * 65)
+    for label, c, p, fmt in rows_to_show:
+        print(f"{label:<22}  {fmt.format(c):>14}  {fmt.format(p):>14}  {_fmt_delta(c, p):>8}")
+
+
+def cmd_list_adgroups(args):
+    where = ["ad_group.status != 'REMOVED'"]
+    if args.campaign:
+        where.append(f"campaign.id = {args.campaign}")
+    if args.status:
+        where.append(f"ad_group.status = '{args.status}'")
+    q = f"""
+    SELECT
+      ad_group.id, ad_group.name, ad_group.status, ad_group.type,
+      campaign.id, campaign.name
+    FROM ad_group
+    WHERE {' AND '.join(where)}
+    ORDER BY campaign.id, ad_group.id
+    """
+    res = api_call("POST", "googleAds:search", {"query": q}, args.customer)
+    rows = res.get("results", [])
+    if not rows:
+        print("Nincs ad group (Performance Max kampányokban nincsenek ad group-ok, csak asset group-ok).")
+        return
+    print(f"{'AG ID':>14}  {'STATUS':<10}  {'TYPE':<24}  {'CAMPAIGN':<28}  AD GROUP NAME")
+    print("-" * 130)
+    for row in rows:
+        ag = row["adGroup"]
+        c = row["campaign"]
+        print(f"{ag['id']:>14}  {ag['status']:<10}  {ag.get('type', '-'):<24}  {c['name'][:28]:<28}  {ag['name']}")
+
+
+def cmd_list_keywords(args):
+    where = ["ad_group_criterion.type = 'KEYWORD'",
+             "ad_group_criterion.status != 'REMOVED'"]
+    if args.campaign:
+        where.append(f"campaign.id = {args.campaign}")
+    if args.ad_group:
+        where.append(f"ad_group.id = {args.ad_group}")
+    if args.status:
+        where.append(f"ad_group_criterion.status = '{args.status}'")
+    q = f"""
+    SELECT
+      ad_group_criterion.criterion_id,
+      ad_group_criterion.keyword.text,
+      ad_group_criterion.keyword.match_type,
+      ad_group_criterion.status,
+      ad_group_criterion.quality_info.quality_score,
+      ad_group_criterion.cpc_bid_micros,
+      ad_group.id, ad_group.name,
+      campaign.id, campaign.name
+    FROM ad_group_criterion
+    WHERE {' AND '.join(where)}
+    ORDER BY campaign.id, ad_group.id, ad_group_criterion.criterion_id
+    LIMIT 500
+    """
+    res = api_call("POST", "googleAds:search", {"query": q}, args.customer)
+    rows = res.get("results", [])
+    if not rows:
+        print("Nincs keyword. (PMAX kampányoknál ez normális — ott search themes vannak.)")
+        return
+    print(f"{'CRIT ID':>14}  {'MATCH':<10}  {'STATUS':<10}  {'QS':>3}  {'BID':>10}  {'CAMPAIGN':<24}  KEYWORD")
+    print("-" * 140)
+    for row in rows:
+        agc = row["adGroupCriterion"]
+        kw = agc.get("keyword", {})
+        c = row.get("campaign", {})
+        bid = agc.get("cpcBidMicros")
+        bid_s = f"{int(bid)/1_000_000:,.0f}" if bid else "-"
+        qs = agc.get("qualityInfo", {}).get("qualityScore", "-")
+        print(f"{agc.get('criterionId', '-'):>14}  {kw.get('matchType', '-'):<10}  {agc['status']:<10}  "
+              f"{str(qs):>3}  {bid_s:>10}  {c.get('name', '-')[:24]:<24}  {kw.get('text', '-')}")
+
+
+# ─── Commands: mutating ───────────────────────────────────────────────────
+
+def cmd_delete_conversion(args):
+    resource = f"customers/{args.customer}/conversionActions/{args.conversion_id}"
+    body = {"operations": [{"remove": resource}]}
+    if not args.apply:
+        dry_run_banner("DELETE conversion action", resource)
+        return
+    res = api_call("POST", "conversionActions:mutate", body, args.customer)
+    print(f"OK — törölve: {resource}")
+    print(json.dumps(res, indent=2))
+
+
+def cmd_disable_url_expansion(args):
+    _set_url_expansion(args, opt_out=True, label="OFF")
+
+
+def cmd_enable_url_expansion(args):
+    _set_url_expansion(args, opt_out=False, label="ON")
+
+
+def _set_url_expansion(args, opt_out, label):
+    resource = f"customers/{args.customer}/campaigns/{args.campaign_id}"
+    body = {
+        "operations": [{
+            "update": {"resourceName": resource, "urlExpansionOptOut": opt_out},
+            "updateMask": "url_expansion_opt_out",
+        }]
+    }
+    if not args.apply:
+        dry_run_banner(f"URL expansion → {label}", resource)
+        print(json.dumps(body, indent=2))
+        return
+    api_call("POST", "campaigns:mutate", body, args.customer)
+    print(f"OK — URL expansion {label} on {resource}")
+
+
+def cmd_set_bid(args):
+    resource = f"customers/{args.customer}/campaigns/{args.campaign_id}"
+    s = args.strategy
+    update = {"resourceName": resource}
+
+    if s == "TARGET_CPA":
+        if not args.target:
+            sys.exit("ERROR: --target kell (HUF összeg, pl. 5000)")
+        update["targetCpa"] = {"targetCpaMicros": int(float(args.target) * 1_000_000)}
+        mask = "target_cpa"
+    elif s == "TARGET_ROAS":
+        if not args.target:
+            sys.exit("ERROR: --target kell (ROAS multiplier, pl. 4.0)")
+        update["targetRoas"] = {"targetRoas": float(args.target)}
+        mask = "target_roas"
+    elif s == "MAXIMIZE_CONVERSIONS":
+        update["maximizeConversions"] = {}
+        mask = "maximize_conversions"
+    elif s == "MAXIMIZE_CONVERSION_VALUE":
+        update["maximizeConversionValue"] = {}
+        mask = "maximize_conversion_value"
+    else:
+        sys.exit(f"ERROR: nem támogatott strategy: {s}")
+
+    body = {"operations": [{"update": update, "updateMask": mask}]}
+    if not args.apply:
+        dry_run_banner(f"BID STRATEGY → {s}" + (f" target={args.target}" if args.target else ""), resource)
+        print(json.dumps(body, indent=2))
+        return
+    api_call("POST", "campaigns:mutate", body, args.customer)
+    print(f"OK — bid strategy {s} on {resource}")
+
+
+# ─── Account-level asset extensions ───────────────────────────────────────
+
+# Account-level asset seed data is now loaded from a TOML pack at runtime.
+# See cmd_seed_account_assets — pass --pack <file> (e.g. account-assets.toml).
+
+
+def _create_asset(asset_body, customer_id):
+    """POST /assets:mutate with a single create operation. Returns resourceName."""
+    body = {"operations": [{"create": asset_body}]}
+    res = api_call("POST", "assets:mutate", body, customer_id)
+    return res["results"][0]["resourceName"]
+
+
+def _link_to_customer(asset_resource_name, field_type, customer_id):
+    """POST /customerAssets:mutate to attach an asset at account scope."""
+    body = {"operations": [{"create": {
+        "asset": asset_resource_name,
+        "fieldType": field_type,
+    }}]}
+    api_call("POST", "customerAssets:mutate", body, customer_id)
+
+
+def _existing_account_assets(customer_id):
+    """Returns dict {field_type: count} of existing non-removed account assets."""
+    q = """
+    SELECT customer_asset.field_type
+    FROM customer_asset
+    WHERE customer_asset.status != 'REMOVED'
+    """
+    res = api_call("POST", "googleAds:search", {"query": q}, customer_id)
+    counts = {}
+    for row in res.get("results", []):
+        ft = row["customerAsset"]["fieldType"]
+        counts[ft] = counts.get(ft, 0) + 1
+    return counts
+
+
+def cmd_list_account_assets(args):
+    q = """
+    SELECT
+      customer_asset.field_type, customer_asset.status,
+      asset.id, asset.type,
+      asset.sitelink_asset.link_text,
+      asset.sitelink_asset.description1,
+      asset.sitelink_asset.description2,
+      asset.callout_asset.callout_text,
+      asset.structured_snippet_asset.header
+    FROM customer_asset
+    WHERE customer_asset.status != 'REMOVED'
+    ORDER BY customer_asset.field_type, asset.id
+    """
+    res = api_call("POST", "googleAds:search", {"query": q}, args.customer)
+    rows = res.get("results", [])
+    if not rows:
+        print("Nincs account-level asset. Futtasd: gads seed-account-assets --apply")
+        return
+    print(f"{'FIELD':<22}  {'ASSET ID':>14}  CONTENT")
+    print("-" * 110)
+    for row in rows:
+        ca = row["customerAsset"]
+        a = row["asset"]
+        ft = ca["fieldType"]
+        if ft == "SITELINK":
+            sl = a.get("sitelinkAsset", {})
+            content = f"{sl.get('linkText', '')}  /  {sl.get('description1', '')}  /  {sl.get('description2', '')}"
+        elif ft == "CALLOUT":
+            content = a.get("calloutAsset", {}).get("calloutText", "")
+        elif ft == "STRUCTURED_SNIPPET":
+            ss = a.get("structuredSnippetAsset", {})
+            content = f"{ss.get('header', '')}: ..."
+        else:
+            content = f"[{a.get('type', '?')}]"
+        print(f"{ft:<22}  {a['id']:>14}  {content}")
+
+
+def cmd_add_sitelink(args):
+    if len(args.text) > 25:
+        sys.exit(f"ERROR: link text {len(args.text)} kar > 25 max")
+    for d, name in ((args.d1, "--d1"), (args.d2, "--d2")):
+        if d and len(d) > 35:
+            sys.exit(f"ERROR: {name} {len(d)} kar > 35 max")
+
+    asset_body = {
+        "finalUrls": [args.url],
+        "sitelinkAsset": {"linkText": args.text},
+    }
+    if args.d1:
+        asset_body["sitelinkAsset"]["description1"] = args.d1
+    if args.d2:
+        asset_body["sitelinkAsset"]["description2"] = args.d2
+
+    if not args.apply:
+        dry_run_banner("CREATE sitelink + link to customer", args.text)
+        print(json.dumps(asset_body, indent=2, ensure_ascii=False))
+        return
+
+    resource = _create_asset(asset_body, args.customer)
+    _link_to_customer(resource, "SITELINK", args.customer)
+    print(f"OK — sitelink '{args.text}' létrehozva és customer-hez linkelve: {resource}")
+
+
+def cmd_add_callout(args):
+    if len(args.text) > 25:
+        sys.exit(f"ERROR: callout text {len(args.text)} kar > 25 max")
+
+    asset_body = {"calloutAsset": {"calloutText": args.text}}
+    if not args.apply:
+        dry_run_banner("CREATE callout + link to customer", args.text)
+        print(json.dumps(asset_body, indent=2, ensure_ascii=False))
+        return
+
+    resource = _create_asset(asset_body, args.customer)
+    _link_to_customer(resource, "CALLOUT", args.customer)
+    print(f"OK — callout '{args.text}' létrehozva és customer-hez linkelve: {resource}")
+
+
+def cmd_add_snippet(args):
+    if len(args.values) < 3:
+        sys.exit(f"ERROR: min 3 érték kell, csak {len(args.values)} adtál meg")
+    for v in args.values:
+        if len(v) > 25:
+            sys.exit(f"ERROR: snippet value '{v}' {len(v)} kar > 25 max")
+
+    asset_body = {"structuredSnippetAsset": {
+        "header": args.header,
+        "values": args.values,
+    }}
+    if not args.apply:
+        dry_run_banner(f"CREATE snippet header={args.header}", ", ".join(args.values))
+        print(json.dumps(asset_body, indent=2, ensure_ascii=False))
+        return
+
+    resource = _create_asset(asset_body, args.customer)
+    _link_to_customer(resource, "STRUCTURED_SNIPPET", args.customer)
+    print(f"OK — snippet '{args.header}' létrehozva és customer-hez linkelve: {resource}")
+
+
+# ─── Headline pack replacement (asset group) ──────────────────────────────
+
+# Headline packs are loaded from brand TOMLs in gads-packs/brands/<name>.toml.
+# Each brand TOML has a `headlines = [...]` array.
+
+
+def _current_headlines(asset_group_id, customer_id):
+    """Return list of {asset_id, text} dicts for HEADLINE-type assets in the group."""
+    q = f"""
+    SELECT
+      asset.id, asset.text_asset.text,
+      asset_group_asset.field_type, asset_group_asset.status
+    FROM asset_group_asset
+    WHERE asset_group.id = {asset_group_id}
+      AND asset_group_asset.field_type = 'HEADLINE'
+      AND asset_group_asset.status != 'REMOVED'
+    """
+    res = api_call("POST", "googleAds:search", {"query": q}, customer_id)
+    return [
+        {"asset_id": row["asset"]["id"], "text": row["asset"]["textAsset"]["text"]}
+        for row in res.get("results", [])
+    ]
+
+
+def _google_width(s):
+    """Google Ads counts en-dash/em-dash/minus/wide chars as 2 each, not 1
+    like Python len(). Approximation: any char outside basic Latin counts as
+    1 unless it's one of the known wide-glyph dashes."""
+    wide = {"–", "—", "−"}  # en-dash, em-dash, minus sign
+    return sum(2 if c in wide else 1 for c in s)
+
+
+def cmd_replace_headlines(args):
+    pack = _load_pack(args.pack, _load_profile(args.profile))
+    new_headlines = pack.get("headlines") or []
+    if not new_headlines:
+        sys.exit(f"ERROR: pack '{args.pack}' nem tartalmaz 'headlines' tömböt")
+    pack_name = pack.get("name", args.pack)
+
+    for h in new_headlines:
+        w = _google_width(h)
+        if w > 30:
+            sys.exit(f"ERROR: '{h}' Google-width {w} > 30 max (en-dash/minus chars-ot ASCII '-'-re)")
+
+    existing = _current_headlines(args.asset_group_id, args.customer)
+    keep_n = max(0, 15 - len(new_headlines))  # Google max is 15 headlines per group
+    to_remove_n = max(0, len(existing) - keep_n)
+
+    print(f"Asset group {args.asset_group_id} — pack: {pack_name.upper()}\n")
+    print(f"  Jelenlegi headlines: {len(existing)}")
+    for i, h in enumerate(existing):
+        marker = "✗ remove" if i < to_remove_n else "✓ keep  "
+        print(f"    {marker}  [{h['asset_id']}]  {h['text']}")
+
+    print(f"\n  Új headlines: {len(new_headlines)}")
+    for h in new_headlines:
+        print(f"    + ({len(h):>2} kar)  {h}")
+
+    final_count = (len(existing) - to_remove_n) + len(new_headlines)
+    print(f"\n  Végállapot: {final_count} headline (Google max: 15)")
+    if final_count > 15:
+        sys.exit("ERROR: végállapot > 15, ami a Google limit. Csökkents.")
+
+    if not args.apply:
+        dry_run_banner(f"REPLACE HEADLINES pack={pack_name}", str(args.asset_group_id))
+        return
+
+    print("\nLépés 1/2: új text asset-ek létrehozása...")
+    asset_create_ops = [
+        {"create": {"textAsset": {"text": h}}} for h in new_headlines
+    ]
+    res = api_call("POST", "assets:mutate", {"operations": asset_create_ops}, args.customer)
+    new_asset_resources = [r["resourceName"] for r in res["results"]]
+    print(f"  ✓ {len(new_asset_resources)} text asset létrehozva")
+
+    print("\nLépés 2/2: asset group linkek (atomic remove + add)...")
+    asset_group_resource = f"customers/{args.customer}/assetGroups/{args.asset_group_id}"
+    ops = []
+    for h in existing[:to_remove_n]:
+        remove_rn = f"customers/{args.customer}/assetGroupAssets/{args.asset_group_id}~{h['asset_id']}~HEADLINE"
+        ops.append({"remove": remove_rn})
+    for asset_rn in new_asset_resources:
+        ops.append({"create": {
+            "assetGroup": asset_group_resource,
+            "asset": asset_rn,
+            "fieldType": "HEADLINE",
+        }})
+    api_call("POST", "assetGroupAssets:mutate", {"operations": ops}, args.customer)
+    print(f"  ✓ {to_remove_n} régi headline eltávolítva, {len(new_asset_resources)} új linkelve\n")
+    print(f"Kész. Ellenőrzés: gads list-assets {args.asset_group_id}")
+
+
+# ─── Asset group: add text assets + image assets by field_type ────────────
+
+# Maps human-friendly text-asset field types to the API field_type enum.
+TEXT_FIELD_TYPES = {
+    "HEADLINE", "DESCRIPTION", "LONG_HEADLINE",
+    "BUSINESS_NAME",
+}
+IMAGE_FIELD_TYPES = {
+    "LOGO", "LANDSCAPE_LOGO",
+    "MARKETING_IMAGE", "SQUARE_MARKETING_IMAGE", "PORTRAIT_MARKETING_IMAGE",
+}
+
+
+def _create_text_asset(text, customer_id):
+    body = {"operations": [{"create": {"textAsset": {"text": text}}}]}
+    res = api_call("POST", "assets:mutate", body, customer_id)
+    return res["results"][0]["resourceName"]
+
+
+def _create_image_asset(file_path, customer_id, name=None):
+    """Upload binary image as IMAGE asset. Returns asset resource name."""
+    with open(file_path, "rb") as f:
+        data = f.read()
+    b64 = base64.b64encode(data).decode("ascii")
+    asset_body = {"type": "IMAGE", "imageAsset": {"data": b64}}
+    if name:
+        asset_body["name"] = name
+    body = {"operations": [{"create": asset_body}]}
+    res = api_call("POST", "assets:mutate", body, customer_id)
+    return res["results"][0]["resourceName"]
+
+
+def _link_asset_to_group(asset_resource, asset_group_id, field_type, customer_id):
+    asset_group_rn = f"customers/{customer_id}/assetGroups/{asset_group_id}"
+    body = {"operations": [{"create": {
+        "assetGroup": asset_group_rn,
+        "asset": asset_resource,
+        "fieldType": field_type,
+    }}]}
+    api_call("POST", "assetGroupAssets:mutate", body, customer_id)
+
+
+def _link_asset_to_campaign(asset_resource, campaign_id, field_type, customer_id):
+    """For PMAX with Brand Guidelines enabled: BUSINESS_NAME and LOGO must
+    link at the campaign level (not asset group)."""
+    campaign_rn = f"customers/{customer_id}/campaigns/{campaign_id}"
+    body = {"operations": [{"create": {
+        "campaign": campaign_rn,
+        "asset": asset_resource,
+        "fieldType": field_type,
+    }}]}
+    api_call("POST", "campaignAssets:mutate", body, customer_id)
+
+
+def _campaign_for_asset_group(asset_group_id, customer_id):
+    """Look up the parent campaign for an asset group."""
+    q = f"SELECT asset_group.campaign FROM asset_group WHERE asset_group.id = {asset_group_id}"
+    res = api_call("POST", "googleAds:search", {"query": q}, customer_id)
+    if not res.get("results"):
+        sys.exit(f"ERROR: asset group {asset_group_id} nem található")
+    return res["results"][0]["assetGroup"]["campaign"].rsplit("/", 1)[-1]
+
+
+# Field types that must link at campaign level when PMAX Brand Guidelines is on.
+CAMPAIGN_LEVEL_BRAND_FIELDS = {"BUSINESS_NAME", "LOGO", "LANDSCAPE_LOGO"}
+
+
+def _smart_link(asset_resource, asset_group_id, field_type, customer_id, reuse_existing=None):
+    """Link an asset using the right endpoint: campaign for BUSINESS_NAME/LOGO
+    under Brand Guidelines, asset group for everything else.
+    `reuse_existing` is an optional asset resource we'd link instead of the
+    newly created one (for orphan recovery)."""
+    rn = reuse_existing or asset_resource
+    if field_type in CAMPAIGN_LEVEL_BRAND_FIELDS:
+        campaign_id = _campaign_for_asset_group(asset_group_id, customer_id)
+        _link_asset_to_campaign(rn, campaign_id, field_type, customer_id)
+        return f"campaign {campaign_id}"
+    _link_asset_to_group(rn, asset_group_id, field_type, customer_id)
+    return f"asset group {asset_group_id}"
+
+
+TEXT_ASSET_LIMITS = {
+    "HEADLINE": 30, "DESCRIPTION": 90, "LONG_HEADLINE": 90,
+    "BUSINESS_NAME": 25,
+}
+
+
+def cmd_add_text_assets(args):
+    if args.field_type not in TEXT_FIELD_TYPES:
+        sys.exit(f"ERROR: {args.field_type} nem text field type")
+    limit = TEXT_ASSET_LIMITS[args.field_type]
+    for t in args.texts:
+        w = _google_width(t)
+        if w > limit:
+            sys.exit(f"ERROR: '{t}' Google-width {w} > {limit} max")
+
+    print(f"Asset group: {args.asset_group_id}")
+    print(f"Field type:  {args.field_type} (limit {limit} kar)")
+    print(f"{len(args.texts)} text asset:")
+    for t in args.texts:
+        print(f"  + ({_google_width(t):>2}) {t}")
+
+    if not args.apply:
+        dry_run_banner(f"ADD {len(args.texts)} {args.field_type}", str(args.asset_group_id))
+        return
+
+    print("\nLépés 1/2: text asset-ek létrehozása...")
+    create_ops = [{"create": {"textAsset": {"text": t}}} for t in args.texts]
+    res = api_call("POST", "assets:mutate", {"operations": create_ops}, args.customer)
+    asset_rns = [r["resourceName"] for r in res["results"]]
+    print(f"  ✓ {len(asset_rns)} text asset létrehozva")
+
+    print(f"Lépés 2/2: linkelés mint {args.field_type}...")
+    for rn in asset_rns:
+        where = _smart_link(rn, args.asset_group_id, args.field_type, args.customer)
+    print(f"  ✓ {len(asset_rns)} link létrehozva ({where})")
+
+
+def cmd_add_business_name(args):
+    name = args.name
+    if len(name) > 25:
+        sys.exit(f"ERROR: business name {len(name)} kar > 25 max")
+    if not args.apply:
+        dry_run_banner(f"CREATE BUSINESS_NAME text asset + link", name)
+        print(f"  Asset group: {args.asset_group_id}  (link auto-resolved to campaign if Brand Guidelines on)")
+        return
+
+    if args.reuse_asset:
+        print(f"Újrahasznosítás: meglévő asset {args.reuse_asset}")
+        rn = f"customers/{args.customer}/assets/{args.reuse_asset}"
+    else:
+        print("Lépés 1/2: text asset létrehozása...")
+        rn = _create_text_asset(name, args.customer)
+        print(f"  ✓ {rn}")
+    print("Lépés 2/2: linkelés...")
+    where = _smart_link(rn, args.asset_group_id, "BUSINESS_NAME", args.customer)
+    print(f"  ✓ Business name '{name}' linkelve ({where})")
+
+
+def cmd_add_youtube_video(args):
+    """Create a YouTube video asset + link to asset group as YOUTUBE_VIDEO."""
+    vid = args.video_id.strip()
+    # Strip common YouTube URL formats to bare ID
+    for prefix in ("https://www.youtube.com/watch?v=", "https://youtu.be/",
+                   "http://www.youtube.com/watch?v=", "youtube.com/watch?v="):
+        if vid.startswith(prefix):
+            vid = vid[len(prefix):].split("&")[0]
+    if not (10 <= len(vid) <= 12) or not all(c.isalnum() or c in "_-" for c in vid):
+        sys.exit(f"ERROR: nem tűnik valid YouTube video ID-nek: {vid}")
+
+    name = args.name or f"youtube-{vid}"
+    print(f"Video ID:    {vid}")
+    print(f"Asset name:  {name}")
+    print(f"Asset group: {args.asset_group_id}")
+    print(f"URL preview: https://www.youtube.com/watch?v={vid}")
+
+    if not args.apply:
+        dry_run_banner("CREATE YOUTUBE_VIDEO asset + link", vid)
+        return
+
+    print("\nLépés 1/2: video asset létrehozása...")
+    asset_body = {
+        "type": "YOUTUBE_VIDEO",
+        "name": name,
+        "youtubeVideoAsset": {"youtubeVideoId": vid},
+    }
+    res = api_call("POST", "assets:mutate",
+                   {"operations": [{"create": asset_body}]}, args.customer)
+    rn = res["results"][0]["resourceName"]
+    print(f"  ✓ {rn}")
+
+    print("Lépés 2/2: linkelés mint YOUTUBE_VIDEO...")
+    _link_asset_to_group(rn, args.asset_group_id, "YOUTUBE_VIDEO", args.customer)
+    print(f"  ✓ Video linkelve")
+
+
+def cmd_upload_image(args):
+    if not os.path.isfile(args.file):
+        sys.exit(f"ERROR: file nem található: {args.file}")
+    if args.field_type not in IMAGE_FIELD_TYPES:
+        sys.exit(f"ERROR: field-type {args.field_type} nem image type. "
+                 f"Választható: {', '.join(IMAGE_FIELD_TYPES)}")
+    size = os.path.getsize(args.file)
+    if size > 5_120_000:
+        sys.exit(f"ERROR: file mérete {size:,} byte > 5,120,000 max")
+
+    name = args.name or f"{args.field_type.lower()}-{os.path.basename(args.file)}"
+    print(f"File:        {args.file}  ({size:,} byte)")
+    print(f"Field type:  {args.field_type}")
+    print(f"Asset name:  {name}")
+    print(f"Asset group: {args.asset_group_id}  (link auto-resolved if Brand Guidelines)")
+
+    if not args.apply:
+        dry_run_banner(f"UPLOAD IMAGE → {args.field_type}", name)
+        return
+
+    print("\nLépés 1/2: image asset feltöltése...")
+    rn = _create_image_asset(args.file, args.customer, name=name)
+    print(f"  ✓ {rn}")
+    print(f"Lépés 2/2: linkelés mint {args.field_type}...")
+    where = _smart_link(rn, args.asset_group_id, args.field_type, args.customer)
+    print(f"  ✓ Image linkelve ({where})")
+
+
+# ─── Asset group splitting: 1 mixed group → N brand-focused groups ────────
+
+# Brand group config is loaded from per-brand TOML files at runtime.
+# Pass --brand-packs <pack1,pack2,pack3> to split-asset-group; each pack
+# defines name, final_url, headlines, descriptions, long_headlines.
+
+
+def _existing_image_assets(source_asset_group_id, customer_id):
+    """Returns list of (asset_resource_name, field_type) for all IMAGE assets
+    in a source asset group — for copying to new groups."""
+    q = f"""
+    SELECT asset.id, asset.resource_name, asset.type, asset_group_asset.field_type
+    FROM asset_group_asset
+    WHERE asset_group.id = {source_asset_group_id}
+      AND asset_group_asset.status != 'REMOVED'
+      AND asset.type = 'IMAGE'
+    """
+    res = api_call("POST", "googleAds:search", {"query": q}, customer_id)
+    return [
+        (row["asset"]["resourceName"], row["assetGroupAsset"]["fieldType"])
+        for row in res.get("results", [])
+    ]
+
+
+def cmd_split_asset_group(args):
+    profile = _load_profile(args.profile)
+    pack_paths = [p.strip() for p in args.brand_packs.split(",") if p.strip()]
+    if not pack_paths:
+        sys.exit("ERROR: --brand-packs needs at least 1 pack (comma-separated)")
+    brands = []
+    for pp in pack_paths:
+        cfg = _load_pack(pp, profile)
+        for key in ("name", "asset_group_name", "final_url", "headlines",
+                    "descriptions", "long_headlines"):
+            if not cfg.get(key):
+                sys.exit(f"ERROR: pack '{pp}' missing required field '{key}'")
+        for h in cfg["headlines"]:
+            if _google_width(h) > 30:
+                sys.exit(f"ERROR: [{cfg['name']}] headline '{h}' Google-width > 30")
+        for d in cfg["descriptions"]:
+            if _google_width(d) > 90:
+                sys.exit(f"ERROR: [{cfg['name']}] description '{d}' Google-width > 90")
+        for lh in cfg["long_headlines"]:
+            if _google_width(lh) > 90:
+                sys.exit(f"ERROR: [{cfg['name']}] long headline '{lh}' Google-width > 90")
+        brands.append(cfg)
+
+    campaign_id = _campaign_for_asset_group(args.source_group, args.customer)
+    print(f"Source asset group: {args.source_group}")
+    print(f"Parent campaign:    {campaign_id}")
+    print(f"New asset groups ({len(brands)}):\n")
+    for cfg in brands:
+        print(f"  {cfg['asset_group_name']}")
+        print(f"    Final URL:       {cfg['final_url']}")
+        print(f"    Headlines:       {len(cfg['headlines'])}")
+        print(f"    Descriptions:    {len(cfg['descriptions'])}")
+        print(f"    Long headlines:  {len(cfg['long_headlines'])}")
+
+    source_images = _existing_image_assets(args.source_group, args.customer)
+    print(f"\n  Images copied from source ({len(source_images)}): {', '.join(set(ft for _, ft in source_images))}")
+
+    if not args.apply:
+        dry_run_banner(f"SPLIT INTO {len(brands)} asset group", "+".join(c["name"] for c in brands))
+        print("\nNote: the source asset group is NOT deleted or paused — handle that yourself in the UI.")
+        return
+
+    campaign_rn = f"customers/{args.customer}/campaigns/{campaign_id}"
+
+    for cfg in brands:
+        print(f"\n══ Brand: {cfg['name'].upper()} ══")
+
+        print(f"  [1/4] Creating asset group...")
+        ag_op = {"create": {
+            "campaign": campaign_rn,
+            "name": cfg["asset_group_name"],
+            "finalUrls": [cfg["final_url"]],
+            "status": "PAUSED",
+        }}
+        res = api_call("POST", "assetGroups:mutate", {"operations": [ag_op]}, args.customer)
+        ag_rn = res["results"][0]["resourceName"]
+        ag_id = ag_rn.rsplit("/", 1)[-1]
+        print(f"     ✓ {ag_rn}")
+
+        print(f"  [2/4] Creating text assets ({len(cfg['headlines'])}h + {len(cfg['descriptions'])}d + {len(cfg['long_headlines'])}lh)...")
+        text_ops, text_map = [], []
+        for h in cfg["headlines"]:
+            text_ops.append({"create": {"textAsset": {"text": h}}})
+            text_map.append("HEADLINE")
+        for d in cfg["descriptions"]:
+            text_ops.append({"create": {"textAsset": {"text": d}}})
+            text_map.append("DESCRIPTION")
+        for lh in cfg["long_headlines"]:
+            text_ops.append({"create": {"textAsset": {"text": lh}}})
+            text_map.append("LONG_HEADLINE")
+        res = api_call("POST", "assets:mutate", {"operations": text_ops}, args.customer)
+        text_resources = [(r["resourceName"], text_map[i]) for i, r in enumerate(res["results"])]
+        print(f"     ✓ {len(text_resources)} text assets")
+
+        print(f"  [3/4] Linking ({len(text_resources) + len(source_images)})...")
+        link_ops = []
+        for rn, ft in text_resources:
+            link_ops.append({"create": {"assetGroup": ag_rn, "asset": rn, "fieldType": ft}})
+        for rn, ft in source_images:
+            link_ops.append({"create": {"assetGroup": ag_rn, "asset": rn, "fieldType": ft}})
+        api_call("POST", "assetGroupAssets:mutate", {"operations": link_ops}, args.customer)
+        print(f"     ✓ {len(link_ops)} links")
+
+        print(f"  [4/4] {cfg['asset_group_name']} (id={ag_id}, PAUSED) done")
+
+    print(f"\n{len(brands)} new asset groups created — all PAUSED.")
+    print(f"Source asset group ({args.source_group}) untouched — pause it in UI if no longer needed.")
+
+
+# ─── Brand Search campaign creator ────────────────────────────────────────
+
+def cmd_create_brand_campaign(args):
+    profile = _load_profile(args.profile)
+    pack = _load_pack(args.pack, profile)
+
+    name = pack.get("name") or "Brand Search"
+    final_url = pack.get("final_url")
+    if not final_url:
+        sys.exit("ERROR: pack must define 'final_url'")
+    daily = float(pack.get("daily_budget") or 0)
+    if daily <= 0:
+        sys.exit("ERROR: pack must define 'daily_budget' > 0")
+    bidding = (pack.get("bidding_strategy") or "MAXIMIZE_CONVERSIONS").upper()
+    status = (pack.get("status_on_create") or "PAUSED").upper()
+    ag_bid_units = int(pack.get("ad_group_bid") or 200)
+
+    keywords = pack.get("keywords") or []
+    headlines = pack.get("headlines") or []
+    descriptions = pack.get("descriptions") or []
+    if not keywords:
+        sys.exit("ERROR: pack must define [[keywords]] (at least 1)")
+    if len(headlines) < 3:
+        sys.exit("ERROR: RSA needs ≥3 headlines")
+    if len(descriptions) < 2:
+        sys.exit("ERROR: RSA needs ≥2 descriptions")
+
+    for h in headlines:
+        if _google_width(h) > 30:
+            sys.exit(f"ERROR: RSA headline '{h}' Google-width > 30")
+    for d in descriptions:
+        if _google_width(d) > 90:
+            sys.exit(f"ERROR: RSA description '{d}' Google-width > 90")
+
+    # Geo targets from profile.locale (list of geoTargetConstant integer IDs)
+    geo_ids = (profile or {}).get("locale", {}).get("geo_targets") or []
+
+    print(f"Brand Search campaign plan:\n")
+    print(f"  Name:          {name}")
+    print(f"  Budget:        {daily:,.0f}/day  (account currency)")
+    print(f"  Bidding:       {bidding}")
+    print(f"  Channel:       SEARCH (Google Search only — Search Network OFF)")
+    print(f"  Status:        {status}")
+    print(f"  Geo targets:   {geo_ids if geo_ids else '(none — campaign will serve everywhere)'}")
+    print(f"  Final URL:     {final_url}\n")
+    print(f"  Keywords ({len(keywords)}):")
+    for kw in keywords:
+        print(f"    • [{kw['match_type']:<7}] {kw['text']}")
+    print(f"\n  RSA headlines ({len(headlines)}):")
+    for h in headlines:
+        print(f"    • ({_google_width(h):>2}) {h}")
+    print(f"\n  RSA descriptions ({len(descriptions)}):")
+    for d in descriptions:
+        print(f"    • ({_google_width(d):>2}) {d}")
+
+    if not args.apply:
+        dry_run_banner("CREATE BRAND SEARCH CAMPAIGN", name)
+        return
+
+    cid = args.customer
+
+    print("\n[1/6] Campaign budget...")
+    micros = int(daily * 1_000_000)
+    budget_op = {"create": {
+        "name": f"{name} — budget",
+        "amountMicros": str(micros),
+        "deliveryMethod": "STANDARD",
+        "explicitlyShared": False,
+    }}
+    res = api_call("POST", "campaignBudgets:mutate", {"operations": [budget_op]}, cid)
+    budget_rn = res["results"][0]["resourceName"]
+    print(f"  ✓ {budget_rn}")
+
+    print(f"\n[2/6] Campaign (SEARCH, {bidding}, {status})...")
+    bidding_field = {
+        "MAXIMIZE_CONVERSIONS": ("maximizeConversions", {}),
+        "MAXIMIZE_CONVERSION_VALUE": ("maximizeConversionValue", {}),
+        "MANUAL_CPC": ("manualCpc", {"enhancedCpcEnabled": False}),
+    }.get(bidding)
+    if not bidding_field:
+        sys.exit(f"ERROR: unsupported bidding_strategy '{bidding}'")
+    campaign_op = {"create": {
+        "name": name,
+        "status": status,
+        "advertisingChannelType": "SEARCH",
+        bidding_field[0]: bidding_field[1],
+        "campaignBudget": budget_rn,
+        "containsEuPoliticalAdvertising": "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
+        "networkSettings": {
+            "targetGoogleSearch": True,
+            "targetSearchNetwork": False,
+            "targetContentNetwork": False,
+            "targetPartnerSearchNetwork": False,
+        },
+    }}
+    res = api_call("POST", "campaigns:mutate", {"operations": [campaign_op]}, cid)
+    campaign_rn = res["results"][0]["resourceName"]
+    print(f"  ✓ {campaign_rn}")
+
+    print(f"\n[3/6] Geo targeting...")
+    if geo_ids:
+        geo_ops = [{"create": {
+            "campaign": campaign_rn,
+            "location": {"geoTargetConstant": f"geoTargetConstants/{g}"},
+        }} for g in geo_ids]
+        api_call("POST", "campaignCriteria:mutate", {"operations": geo_ops}, cid)
+        print(f"  ✓ {len(geo_ids)} geo target hozzáadva")
+    else:
+        print(f"  — no geo_targets in profile, skipping")
+
+    print("\n[4/6] Ad group...")
+    ad_group_op = {"create": {
+        "name": f"{name} — Brand",
+        "campaign": campaign_rn,
+        "type": "SEARCH_STANDARD",
+        "status": "ENABLED",
+        "cpcBidMicros": str(ag_bid_units * 1_000_000),
+    }}
+    res = api_call("POST", "adGroups:mutate", {"operations": [ad_group_op]}, cid)
+    ad_group_rn = res["results"][0]["resourceName"]
+    print(f"  ✓ {ad_group_rn}")
+
+    print(f"\n[5/6] {len(keywords)} keywords...")
+    kw_ops = [{"create": {
+        "adGroup": ad_group_rn,
+        "status": "ENABLED",
+        "keyword": {"text": kw["text"], "matchType": kw["match_type"]},
+    }} for kw in keywords]
+    api_call("POST", "adGroupCriteria:mutate", {"operations": kw_ops}, cid)
+    print(f"  ✓ {len(keywords)} keywords added")
+
+    print("\n[6/6] Responsive Search Ad...")
+    rsa_op = {"create": {
+        "adGroup": ad_group_rn,
+        "status": "ENABLED",
+        "ad": {
+            "finalUrls": [final_url],
+            "responsiveSearchAd": {
+                "headlines": [{"text": h} for h in headlines],
+                "descriptions": [{"text": d} for d in descriptions],
+            },
+        },
+    }}
+    api_call("POST", "adGroupAds:mutate", {"operations": [rsa_op]}, cid)
+    print(f"  ✓ RSA created")
+
+    print(f"\nDone. Campaign is {status} — review and enable manually if needed.")
+    print(f"Campaign ID: {campaign_rn.rsplit('/',1)[-1]}")
+
+
+def _check_url(url):
+    """HEAD-fallback-GET to check a URL returns 2xx. Returns status code or 0."""
+    for method in ("HEAD", "GET"):
+        try:
+            req = urllib.request.Request(url, method=method,
+                                         headers={"User-Agent": "gads-cli/1.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status
+        except urllib.error.HTTPError as e:
+            return e.code
+        except Exception:
+            continue
+    return 0
+
+
+def cmd_seed_account_assets(args):
+    pack = _load_pack(args.pack, _load_profile(args.profile))
+    sitelinks = pack.get("sitelinks", [])
+    callouts = pack.get("callouts", [])
+    snippets = pack.get("snippets", [])
+
+    existing = _existing_account_assets(args.customer)
+    has_any = any(
+        existing.get(ft, 0) > 0
+        for ft in ("SITELINK", "CALLOUT", "STRUCTURED_SNIPPET")
+    )
+    if has_any and not args.force:
+        print("⚠️  Already account-level assets in this account:")
+        for ft in ("SITELINK", "CALLOUT", "STRUCTURED_SNIPPET"):
+            n = existing.get(ft, 0)
+            if n:
+                print(f"     {ft}: {n}")
+        print("\nUse --force to seed anyway (will duplicate).")
+        print("Or inspect existing: gads list-account-assets")
+        return
+
+    print(f"Planned changes for customer {args.customer} (pack: {args.pack}):\n")
+    print(f"  {len(sitelinks)} SITELINK:")
+    broken_urls = []
+    for sl in sitelinks:
+        code = _check_url(sl["url"])
+        flag = "✓" if 200 <= code < 300 else f"✗ HTTP {code}"
+        if not (200 <= code < 300):
+            broken_urls.append((sl["text"], sl["url"], code))
+        print(f"    {flag}  {sl['text']:<22}  → {sl['url']}")
+        print(f"          d1: {sl.get('d1', '')}")
+        print(f"          d2: {sl.get('d2', '')}")
+    if broken_urls and not args.skip_url_check:
+        print(f"\n  ⚠️  {len(broken_urls)} URL not 2xx — Google Ads will disapprove.")
+        print(f"     Fix the pack, or pass --skip-url-check.")
+
+    print(f"\n  {len(callouts)} CALLOUT:")
+    for c in callouts:
+        print(f"    • {c}  ({len(c)} chars)")
+
+    print(f"\n  {len(snippets)} STRUCTURED_SNIPPET:")
+    for s in snippets:
+        print(f"    • {s['header']}: {', '.join(s['values'])}")
+
+    if not args.apply:
+        dry_run_banner(f"SEED {len(sitelinks)}+{len(callouts)}+{len(snippets)} account-level asset", args.customer)
+        return
+
+    if broken_urls and not args.skip_url_check:
+        sys.exit("\n❌ Refusing to run — broken URLs. Add --skip-url-check to override.")
+
+    print("\nExecuting...")
+    for sl in sitelinks:
+        body = {
+            "finalUrls": [sl["url"]],
+            "sitelinkAsset": {
+                "linkText": sl["text"],
+                "description1": sl.get("d1", ""),
+                "description2": sl.get("d2", ""),
+            },
+        }
+        r = _create_asset(body, args.customer)
+        _link_to_customer(r, "SITELINK", args.customer)
+        print(f"  ✓ sitelink  {sl['text']:<22}  → {r.rsplit('/', 1)[-1]}")
+
+    for c in callouts:
+        r = _create_asset({"calloutAsset": {"calloutText": c}}, args.customer)
+        _link_to_customer(r, "CALLOUT", args.customer)
+        print(f"  ✓ callout   {c:<26}  → {r.rsplit('/', 1)[-1]}")
+
+    for s in snippets:
+        r = _create_asset({"structuredSnippetAsset": {"header": s["header"], "values": s["values"]}}, args.customer)
+        _link_to_customer(r, "STRUCTURED_SNIPPET", args.customer)
+        print(f"  ✓ snippet   {s['header']:<26}  → {r.rsplit('/', 1)[-1]}")
+
+    print("\nDone. Verify: gads list-account-assets")
+
+
+def cmd_set_budget(args):
+    # Need to fetch the budget resource for this campaign first
+    q = f"SELECT campaign_budget.resource_name FROM campaign WHERE campaign.id = {args.campaign_id}"
+    res = api_call("POST", "googleAds:search", {"query": q}, args.customer)
+    rows = res.get("results", [])
+    if not rows:
+        sys.exit(f"ERROR: nem található kampány {args.campaign_id}")
+    budget_resource = rows[0]["campaignBudget"]["resourceName"]
+
+    micros = int(float(args.daily) * 1_000_000)
+    body = {
+        "operations": [{
+            "update": {"resourceName": budget_resource, "amountMicros": str(micros)},
+            "updateMask": "amount_micros",
+        }]
+    }
+    if not args.apply:
+        dry_run_banner(f"BUDGET → {args.daily} HUF/nap", budget_resource)
+        print(json.dumps(body, indent=2))
+        return
+    api_call("POST", "campaignBudgets:mutate", body, args.customer)
+    print(f"OK — napi budget {args.daily} HUF on {budget_resource}")
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="gads",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--customer", default=None,
+                        help="Customer ID (override profile)")
+    parser.add_argument("--profile", default=None,
+                        help="Profile name from ~/.config/gads/profiles/<name>.toml "
+                             "(or set GADS_PROFILE env or default_profile in config.toml)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("list-profiles").set_defaults(func=cmd_list_profiles)
+    sub.add_parser("list-campaigns").set_defaults(func=cmd_list_campaigns)
+    sub.add_parser("list-conversions").set_defaults(func=cmd_list_conversions)
+    sub.add_parser("list-recommendations").set_defaults(func=cmd_list_recommendations)
+
+    p = sub.add_parser("list-assets")
+    p.add_argument("asset_group_id")
+    p.set_defaults(func=cmd_list_assets)
+
+    p = sub.add_parser("gaql")
+    p.add_argument("query")
+    p.set_defaults(func=cmd_gaql)
+
+    p = sub.add_parser("delete-conversion")
+    p.add_argument("conversion_id")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_delete_conversion)
+
+    p = sub.add_parser("disable-url-expansion")
+    p.add_argument("campaign_id")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_disable_url_expansion)
+
+    p = sub.add_parser("enable-url-expansion")
+    p.add_argument("campaign_id")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_enable_url_expansion)
+
+    p = sub.add_parser("set-bid")
+    p.add_argument("campaign_id")
+    p.add_argument("--strategy", required=True,
+                   choices=["TARGET_CPA", "TARGET_ROAS",
+                            "MAXIMIZE_CONVERSIONS", "MAXIMIZE_CONVERSION_VALUE"])
+    p.add_argument("--target")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_set_bid)
+
+    p = sub.add_parser("set-budget")
+    p.add_argument("campaign_id")
+    p.add_argument("--daily", required=True, help="Napi budget HUF-ban")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_set_budget)
+
+    p = sub.add_parser("stats")
+    p.add_argument("--days", type=int, help="Utolsó N nap (alapért. 30)")
+    p.add_argument("--start", help="YYYY-MM-DD")
+    p.add_argument("--end", help="YYYY-MM-DD")
+    p.add_argument("--campaign", help="Szűrés campaign ID-ra")
+    p.set_defaults(func=cmd_stats)
+
+    p = sub.add_parser("stats-vs-prev")
+    p.add_argument("--days", type=int, default=14,
+                   help="Időszak hossza, alapért. 14 (utolsó 14 vs előző 14)")
+    p.add_argument("--campaign", help="Szűrés campaign ID-ra")
+    p.set_defaults(func=cmd_stats_vs_prev)
+
+    p = sub.add_parser("list-adgroups")
+    p.add_argument("--campaign", help="Szűrés campaign ID-ra")
+    p.add_argument("--status", choices=["ENABLED", "PAUSED"])
+    p.set_defaults(func=cmd_list_adgroups)
+
+    p = sub.add_parser("list-keywords")
+    p.add_argument("--campaign", help="Szűrés campaign ID-ra")
+    p.add_argument("--ad-group", dest="ad_group", help="Szűrés ad group ID-ra")
+    p.add_argument("--status", choices=["ENABLED", "PAUSED"])
+    p.set_defaults(func=cmd_list_keywords)
+
+    sub.add_parser("list-account-assets").set_defaults(func=cmd_list_account_assets)
+
+    p = sub.add_parser("add-sitelink")
+    p.add_argument("text", help="Link szöveg, max 25 kar")
+    p.add_argument("url", help="Final URL, pl. https://teherguminet.hu/hu/superway")
+    p.add_argument("--d1", help="Description 1 (max 35 kar)")
+    p.add_argument("--d2", help="Description 2 (max 35 kar)")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_add_sitelink)
+
+    p = sub.add_parser("add-callout")
+    p.add_argument("text", help="Callout szöveg, max 25 kar")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_add_callout)
+
+    p = sub.add_parser("add-snippet")
+    p.add_argument("header", help="Snippet fejléc (pl. Márkák, Stílus)")
+    p.add_argument("values", nargs="+", help="Min 3 érték, mindegyik max 25 kar")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_add_snippet)
+
+    p = sub.add_parser("seed-account-assets")
+    p.add_argument("--pack", required=True, help="TOML pack with sitelinks/callouts/snippets")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="Run even if account already has account-level assets")
+    p.add_argument("--skip-url-check", action="store_true",
+                   help="Skip HEAD check on sitelink URLs")
+    p.set_defaults(func=cmd_seed_account_assets)
+
+    p = sub.add_parser("replace-headlines")
+    p.add_argument("asset_group_id")
+    p.add_argument("--pack", required=True,
+                   help="Brand TOML with 'headlines' array (or bare brand name)")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_replace_headlines)
+
+    p = sub.add_parser("add-text-assets")
+    p.add_argument("asset_group_id")
+    p.add_argument("--field-type", required=True, dest="field_type",
+                   choices=sorted(TEXT_FIELD_TYPES))
+    p.add_argument("texts", nargs="+", help="Text asset stringek (kar limit field-type-függő)")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_add_text_assets)
+
+    p = sub.add_parser("add-business-name")
+    p.add_argument("asset_group_id")
+    p.add_argument("name", help="Brand név, max 25 kar")
+    p.add_argument("--reuse-asset", help="Meglévő orphan text asset ID újrahasználata")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_add_business_name)
+
+    p = sub.add_parser("upload-image")
+    p.add_argument("asset_group_id")
+    p.add_argument("file", help="Image file path")
+    p.add_argument("--field-type", required=True, dest="field_type",
+                   choices=sorted(IMAGE_FIELD_TYPES))
+    p.add_argument("--name", help="Asset név (opcionális)")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_upload_image)
+
+    p = sub.add_parser("add-youtube-video")
+    p.add_argument("asset_group_id")
+    p.add_argument("video_id", help="YouTube video ID vagy URL")
+    p.add_argument("--name", help="Asset név (opcionális)")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_add_youtube_video)
+
+    p = sub.add_parser("split-asset-group")
+    p.add_argument("source_group", help="Source asset group ID (images copied from here)")
+    p.add_argument("--brand-packs", required=True, dest="brand_packs",
+                   help="Comma-separated list of brand TOML pack paths or names")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_split_asset_group)
+
+    p = sub.add_parser("create-brand-campaign")
+    p.add_argument("--pack", required=True,
+                   help="Brand Search TOML (name, budget, keywords, headlines, descriptions)")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=cmd_create_brand_campaign)
+
+    args = parser.parse_args()
+    # list-profiles doesn't need a customer; everything else does.
+    if args.cmd != "list-profiles":
+        args.customer = _resolve_customer(args)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
