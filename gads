@@ -323,6 +323,7 @@ _COMMANDS_MANIFEST = [
     ("snapshot list",            "read",   False, "List all snapshots",                     "gads snapshot list"),
     ("snapshot diff",            "read",   False, "Diff a snapshot against live",           "gads snapshot diff latest"),
     ("snapshot restore",         "mutate", True,  "Restore a snapshot to live (uses sync)", "gads snapshot restore latest --apply"),
+    ("snapshot prune",           "mutate", True,  "Delete old local snapshots (no API)",    "gads snapshot prune --older-than 7d --apply"),
     ("health",                   "read",   False, "Single-command account dashboard",        "gads health"),
     ("audit-log",                "read",   False, "Recent --apply mutations from ~/.gads/audit.log", "gads audit-log --tail 20"),
 ]
@@ -2817,6 +2818,68 @@ def cmd_snapshot_restore(args):
     cmd_sync(args)
 
 
+def _parse_duration(s):
+    """Parse a duration shorthand into seconds. Accepts '7d', '24h',
+    '30m', '60s' (a bare integer is treated as seconds)."""
+    s = s.strip().lower()
+    if not s:
+        raise ValueError("empty duration")
+    if s[-1].isdigit():
+        return int(s)
+    unit = s[-1]
+    n = int(s[:-1])
+    if unit == "d": return n * 86400
+    if unit == "h": return n * 3600
+    if unit == "m": return n * 60
+    if unit == "s": return n
+    raise ValueError(f"unknown duration unit: {unit!r} (use s/m/h/d)")
+
+
+def cmd_snapshot_prune(args):
+    snapshots = _snapshot_list()
+    if not snapshots:
+        print("No snapshots to prune.")
+        return
+
+    if args.keep is not None and args.older_than:
+        sys.exit("ERROR: pass --keep OR --older-than, not both.")
+    if args.keep is None and not args.older_than:
+        sys.exit("ERROR: pass --older-than <duration> (e.g. 7d) or --keep <N>.")
+
+    if args.keep is not None:
+        if args.keep < 0:
+            sys.exit("ERROR: --keep must be >= 0")
+        to_delete = snapshots[args.keep:]
+    else:
+        try:
+            cutoff_s = _parse_duration(args.older_than)
+        except ValueError as e:
+            sys.exit(f"ERROR: bad --older-than value: {e}")
+        cutoff_ts = datetime.datetime.now().timestamp() - cutoff_s
+        to_delete = [s for s in snapshots if s.stat().st_mtime < cutoff_ts]
+
+    if not to_delete:
+        print("✓ Nothing to prune.")
+        return
+
+    print(f"{len(to_delete)} snapshot(s) marked for deletion:")
+    for s in to_delete[:10]:
+        when = datetime.datetime.fromtimestamp(s.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        print(f"  {s.stem:<40}  {when}")
+    if len(to_delete) > 10:
+        print(f"  ... and {len(to_delete) - 10} more")
+
+    print(f"\n{len(snapshots) - len(to_delete)} snapshot(s) will be kept.")
+
+    if not args.apply:
+        dry_run_banner(f"DELETE {len(to_delete)} snapshot(s)", str(_snapshot_dir()))
+        return
+
+    for s in to_delete:
+        s.unlink()
+    print(f"\n✓ Deleted {len(to_delete)} snapshot(s).")
+
+
 # ─── Orphan cleanup ───────────────────────────────────────────────────────
 
 def _orphan_budgets(customer_id):
@@ -3073,6 +3136,12 @@ def main():
     s_restore.add_argument("snapshot")
     s_restore.add_argument("--apply", action="store_true")
     s_restore.set_defaults(func=cmd_snapshot_restore)
+
+    s_prune = snap_sub.add_parser("prune", help="Delete old local snapshots (does not touch the Ads account)")
+    s_prune.add_argument("--older-than", help="Delete snapshots older than this. e.g. 7d, 24h, 30m")
+    s_prune.add_argument("--keep", type=int, help="Keep newest N snapshots, delete the rest")
+    s_prune.add_argument("--apply", action="store_true")
+    s_prune.set_defaults(func=cmd_snapshot_prune)
 
     p = sub.add_parser("cleanup-orphans")
     p.add_argument("--type", default="all", choices=["budget", "asset", "all"],

@@ -36,6 +36,11 @@ jobs:
           pip install pyflakes
           pyflakes gads || (echo "Pyflakes found issues."; exit 1)
 
+      - name: pytest
+        run: |
+          pip install pytest
+          pytest -v
+
   tui:
     name: Rust TUI · build + clippy
     runs-on: ubuntu-latest
