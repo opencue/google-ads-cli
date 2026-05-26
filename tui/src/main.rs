@@ -12,7 +12,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -58,8 +60,8 @@ enum InputMode {
     Budget {
         campaign_id: String,
         campaign_name: String,
-        current: String,   // existing budget for display
-        buffer: String,    // user-typed digits
+        current: String, // existing budget for display
+        buffer: String,  // user-typed digits
     },
 }
 
@@ -95,14 +97,22 @@ impl App {
             self.input_mode = Some(InputMode::Budget {
                 campaign_id: c.id.clone(),
                 campaign_name: c.name.clone(),
-                current: c.budget_units.map(|u| format!("{u:.0}")).unwrap_or("—".into()),
+                current: c
+                    .budget_units
+                    .map(|u| format!("{u:.0}"))
+                    .unwrap_or("—".into()),
                 buffer: String::new(),
             });
         }
     }
 
     fn commit_budget_input(&mut self) -> Result<()> {
-        let (campaign_id, value) = if let Some(InputMode::Budget { campaign_id, buffer, .. }) = &self.input_mode {
+        let (campaign_id, value) = if let Some(InputMode::Budget {
+            campaign_id,
+            buffer,
+            ..
+        }) = &self.input_mode
+        {
             if buffer.is_empty() {
                 self.status_message = "Budget empty — cancelled.".into();
                 self.input_mode = None;
@@ -133,13 +143,19 @@ impl App {
     }
 
     fn selected_campaign(&self) -> Option<&Campaign> {
-        self.table_state.selected().and_then(|i| self.campaigns.get(i))
+        self.table_state
+            .selected()
+            .and_then(|i| self.campaigns.get(i))
     }
 
     fn toggle_selected_status(&mut self) -> Result<()> {
         let (id, new_status) = match self.selected_campaign() {
             Some(c) => {
-                let new = if c.status == "ENABLED" { "PAUSED" } else { "ENABLED" };
+                let new = if c.status == "ENABLED" {
+                    "PAUSED"
+                } else {
+                    "ENABLED"
+                };
                 (c.id.clone(), new.to_string())
             }
             None => return Ok(()),
@@ -147,9 +163,7 @@ impl App {
         self.status_message = format!("Setting campaign {id} → {new_status}…");
         let out = Command::new("gads")
             .env("GADS_NO_AUTOSNAPSHOT", "1") // skip per-keypress snapshot churn
-            .args([
-                "set-status", "campaign", &id, &new_status, "--apply",
-            ])
+            .args(["set-status", "campaign", &id, &new_status, "--apply"])
             .output()
             .context("failed to spawn `gads set-status`")?;
         if out.status.success() {
@@ -174,7 +188,10 @@ impl App {
         if !out.status.success() {
             self.status_message = format!(
                 "✗ suggest failed: {}",
-                String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or("")
+                String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
             );
             return Ok(());
         }
@@ -199,7 +216,10 @@ impl App {
             self.status_message = format!(
                 "gads exited {}: {}",
                 out.status,
-                String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or("")
+                String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
             );
             return Ok(());
         }
@@ -209,10 +229,7 @@ impl App {
         if self.table_state.selected().is_none() && !self.campaigns.is_empty() {
             self.table_state.select(Some(0));
         }
-        self.status_message = format!(
-            "{} campaign(s) · refreshed just now",
-            self.campaigns.len()
-        );
+        self.status_message = format!("{} campaign(s) · refreshed just now", self.campaigns.len());
         Ok(())
     }
 
@@ -293,7 +310,10 @@ fn run(terminal: &mut Term, app: &mut App) -> Result<()> {
 
                 // Esc closes the suggest modal first if it's open.
                 if app.show_suggest
-                    && matches!(key.code, KeyCode::Esc | KeyCode::Char('s') | KeyCode::Char('q'))
+                    && matches!(
+                        key.code,
+                        KeyCode::Esc | KeyCode::Char('s') | KeyCode::Char('q')
+                    )
                 {
                     app.show_suggest = false;
                     continue;
@@ -341,7 +361,6 @@ fn ui(f: &mut Frame, app: &App) {
     }
 }
 
-
 fn render_input_modal(f: &mut Frame, app: &App) {
     let im = match &app.input_mode {
         Some(im) => im,
@@ -352,12 +371,20 @@ fn render_input_modal(f: &mut Frame, app: &App) {
     f.render_widget(Clear, area);
 
     let (title, lines) = match im {
-        InputMode::Budget { campaign_name, current, buffer, .. } => {
+        InputMode::Budget {
+            campaign_name,
+            current,
+            buffer,
+            ..
+        } => {
             let title = " Set daily budget · Enter to commit · Esc to cancel ";
             let body = vec![
                 Line::from(vec![
                     Span::raw("Campaign: "),
-                    Span::styled(campaign_name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        campaign_name.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::raw("Current:  "),
@@ -368,8 +395,14 @@ fn render_input_modal(f: &mut Frame, app: &App) {
                 Line::from(vec![
                     Span::raw("New:      "),
                     Span::styled(
-                        if buffer.is_empty() { "_".to_string() } else { format!("{buffer}_") },
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        if buffer.is_empty() {
+                            "_".to_string()
+                        } else {
+                            format!("{buffer}_")
+                        },
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(" /day"),
                 ]),
@@ -382,12 +415,15 @@ fn render_input_modal(f: &mut Frame, app: &App) {
         Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .title_style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
             .padding(Padding::uniform(1)),
     );
     f.render_widget(p, area);
 }
-
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let outer = Layout::default()
@@ -408,7 +444,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(outer[1])[1]
 }
 
-
 fn severity_color(sev: &str) -> Color {
     match sev {
         "P0" => Color::Red,
@@ -417,7 +452,6 @@ fn severity_color(sev: &str) -> Color {
         _ => Color::Gray,
     }
 }
-
 
 fn render_suggest_modal(f: &mut Frame, app: &App) {
     let area = centered_rect(70, 80, f.area());
@@ -434,7 +468,9 @@ fn render_suggest_modal(f: &mut Frame, app: &App) {
             Span::raw("Optimization Score: "),
             Span::styled(
                 format!("{:.0}%", score * 100.0),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
         lines.push(Line::from(""));
@@ -451,7 +487,10 @@ fn render_suggest_modal(f: &mut Frame, app: &App) {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {} ", issue.severity),
-                    Style::default().bg(color).fg(Color::Black).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .bg(color)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(
@@ -472,7 +511,9 @@ fn render_suggest_modal(f: &mut Frame, app: &App) {
                         Span::raw("      "),
                         Span::styled(
                             format!("$ {}", cmd.trim()),
-                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
                         ),
                     ]));
                 }
@@ -481,24 +522,28 @@ fn render_suggest_modal(f: &mut Frame, app: &App) {
         }
         if payload.issues.len() > 8 {
             lines.push(Line::from(Span::styled(
-                format!("(+{} more — run `gads suggest` in the shell for full list)", payload.issues.len() - 8),
+                format!(
+                    "(+{} more — run `gads suggest` in the shell for full list)",
+                    payload.issues.len() - 8
+                ),
                 Style::default().fg(Color::DarkGray),
             )));
         }
     }
 
-    let p = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" gads suggest · press s/Esc to close ")
-                .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-                .padding(Padding::uniform(1)),
-        );
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" gads suggest · press s/Esc to close ")
+            .title_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .padding(Padding::uniform(1)),
+    );
     f.render_widget(p, area);
 }
-
 
 // Minimal manual word-wrap so we don't pull in a string-utils crate.
 fn textwrap_lines(s: &str, max_width: usize) -> Vec<String> {
@@ -531,12 +576,12 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .padding(Padding::horizontal(1));
-    let p = Paragraph::new(Line::from(vec![
-        Span::styled(
-            title,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
-    ]))
+    let p = Paragraph::new(Line::from(vec![Span::styled(
+        title,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]))
     .block(block);
     f.render_widget(p, area);
 }
@@ -567,10 +612,16 @@ fn render_table(f: &mut Frame, area: Rect, app: &App) {
                 .budget_units
                 .map(|u| format!("{u:.0}"))
                 .unwrap_or_else(|| "—".into());
-            let bid = c.bidding_strategy_type.clone().unwrap_or_else(|| "-".into());
+            let bid = c
+                .bidding_strategy_type
+                .clone()
+                .unwrap_or_else(|| "-".into());
             Row::new(vec![
                 Cell::from(c.id.clone()),
-                Cell::from(Span::styled(c.status.clone(), Style::default().fg(status_color))),
+                Cell::from(Span::styled(
+                    c.status.clone(),
+                    Style::default().fg(status_color),
+                )),
                 Cell::from(c.channel_type.clone()),
                 Cell::from(bid),
                 Cell::from(budget),
@@ -614,7 +665,10 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(" budget  "),
         Span::styled(" s ", Style::default().bg(Color::DarkGray).fg(Color::White)),
         Span::raw(" suggest  "),
-        Span::styled(" ↑↓ ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Span::styled(
+            " ↑↓ ",
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+        ),
         Span::raw(" nav  "),
     ];
 

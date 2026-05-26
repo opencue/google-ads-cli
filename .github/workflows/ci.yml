@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python · compile + lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"   # needs tomllib (stdlib in 3.11+)
+
+      - name: Compile gads
+        run: python3 -m py_compile gads
+
+      - name: --help smoke test
+        run: python3 gads --help
+
+      - name: commands manifest smoke test (no network needed)
+        run: python3 gads commands
+
+      - name: Pyflakes lint
+        run: |
+          pip install pyflakes
+          pyflakes gads || (echo "Pyflakes found issues."; exit 1)
+
+  tui:
+    name: Rust TUI · build + clippy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tui
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tui
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --release -- -D warnings
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: Binary size report
+        run: ls -lh target/release/gads-tui
+
+  packs:
+    name: Example packs · TOML validity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Validate every example TOML
+        run: |
+          set -e
+          for f in $(find examples skills/gads-cli -name "*.toml"); do
+            echo "Checking $f"
+            python3 -c "import tomllib, sys; tomllib.load(open(sys.argv[1], 'rb'))" "$f"
+          done
